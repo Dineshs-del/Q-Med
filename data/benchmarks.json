@@ -1,0 +1,42 @@
+{
+  "H2": {
+    "id": "H2",
+    "name": "Hydrogen (H2)",
+    "smiles": "[H][H]",
+    "basis": "STO-3G",
+    "charge": 0,
+    "spin": 0,
+    "geometry_note": "Equilibrium bond length 0.735 Angstrom along z-axis",
+    "atoms": [
+      {"symbol": "H", "coords": [0.0, 0.0, 0.0]},
+      {"symbol": "H", "coords": [0.0, 0.0, 0.735]}
+    ]
+  },
+  "LiH": {
+    "id": "LiH",
+    "name": "Lithium Hydride (LiH)",
+    "smiles": "[Li][H]",
+    "basis": "STO-3G",
+    "charge": 0,
+    "spin": 0,
+    "geometry_note": "Equilibrium bond length 1.595 Angstrom along z-axis",
+    "atoms": [
+      {"symbol": "Li", "coords": [0.0, 0.0, 0.0]},
+      {"symbol": "H", "coords": [0.0, 0.0, 1.595]}
+    ]
+  },
+  "H2O": {
+    "id": "H2O",
+    "name": "Water (H2O)",
+    "smiles": "O",
+    "basis": "STO-3G",
+    "charge": 0,
+    "spin": 0,
+    "geometry_note": "Standard gas-phase equilibrium geometry (r_OH = 0.9572 A, angle_HOH = 104.52 deg)",
+    "atoms": [
+      {"symbol": "O", "coords": [0.0, 0.0, 0.0]},
+      {"symbol": "H", "coords": [0.0, 0.75695, 0.585882]},
+      {"symbol": "H", "coords": [0.0, -0.75695, 0.585882]}
+    ]
+  }
+}

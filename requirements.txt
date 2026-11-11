@@ -1,0 +1,13 @@
+matplotlib==3.10.9
+numpy==1.26.4
+pandas==2.3.3
+plotly==7.1.0
+pyscf==2.15.0
+pytest==9.2.0
+qiskit==1.2.4
+qiskit-aer==0.17.2
+qiskit-algorithms==0.4.0
+qiskit-nature==0.7.2
+rdkit==2026.9.1
+scipy==1.15.3
+streamlit==1.65.0

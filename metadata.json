@@ -1,0 +1,6 @@
+{
+  "name": "Q-Med",
+  "description": "Quantum chemistry eligibility and VQE benchmark decision-support prototype.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
