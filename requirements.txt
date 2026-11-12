@@ -2,6 +2,7 @@ matplotlib==3.10.9
 numpy==1.26.4
 pandas==2.3.3
 plotly==7.1.0
+py3Dmol==2.5.5
 pyscf==2.15.0
 pytest==9.2.0
 qiskit==1.2.4
