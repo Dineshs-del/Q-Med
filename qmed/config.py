@@ -55,3 +55,15 @@ HIGH_RELIABILITY_ERROR_HA: float = 0.0016
 HIGH_RELIABILITY_UNCERTAINTY_HA: float = 0.0016
 MEDIUM_RELIABILITY_ERROR_HA: float = 0.0100
 LOW_RELIABILITY_ERROR_HA: float = 0.0500
+
+# Batch screening defaults and capped active-space policy
+BATCH_MAX_ROWS: int = 500
+BATCH_CAPPED_ACTIVE_SPACE: Tuple[int, int] = (4, 4)
+BATCH_DEFAULT_MAX_SIMULATED: int = 10
+BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC: float = 60.0
+BATCH_DEFAULT_TOTAL_BUDGET_SEC: float = 300.0
+BATCH_GEOMETRY_SEED: int = 42
+BATCH_CUSTOM_GEOMETRY_CAPTION: str = (
+    "Approximate force-field geometry; reference calculated on the same geometry."
+)
+

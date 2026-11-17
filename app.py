@@ -10,7 +10,19 @@ from rdkit.Chem import Draw
 import streamlit as st
 import streamlit.components.v1 as components
 
+from qmed.batch import (
+    BatchConfig,
+    BatchRunResult,
+    get_sample_batch_csv,
+    run_batch_screening,
+    validate_batch_csv,
+)
 from qmed.config import (
+    BATCH_CUSTOM_GEOMETRY_CAPTION,
+    BATCH_DEFAULT_MAX_SIMULATED,
+    BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC,
+    BATCH_DEFAULT_TOTAL_BUDGET_SEC,
+    BATCH_MAX_ROWS,
     DEFAULT_BENCHMARK_SEEDS,
     DEFAULT_DB_PATH,
     HIGH_RELIABILITY_ERROR_HA,
@@ -765,6 +777,284 @@ def render_history_tab(db_path: Path = DEFAULT_DB_PATH) -> None:
         )
 
 
+def build_batch_decisions_chart(batch_res: BatchRunResult) -> go.Figure:
+    """Create a Plotly bar chart of molecule counts per QEE decision in a batch run."""
+    counts: Dict[str, int] = {}
+    for item in batch_res.items:
+        counts[item.qee_decision] = counts.get(item.qee_decision, 0) + 1
+
+    decisions = list(counts.keys())
+    values = [counts[d] for d in decisions]
+    colors = [DECISION_COLORS.get(d, "#64748b") for d in decisions]
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                x=decisions,
+                y=values,
+                marker_color=colors,
+                text=[str(v) for v in values],
+                textposition="outside",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Batch Screening — Molecule Count by QEE Decision",
+        xaxis_title="QEE Decision",
+        yaxis_title="Number of Molecules",
+        template="plotly_white",
+        height=360,
+    )
+    return fig
+
+
+def render_batch_screening_tab(
+    seeds: Tuple[int, ...],
+    run_noisy_default: bool,
+    noisy_mode: str,
+    shots: int,
+    db_path: Path = DEFAULT_DB_PATH,
+) -> None:
+    """Render Tab 4: Batch CSV Screening, Validation, Capped VQE Simulation, and Results Filter/Export."""
+    st.subheader("Batch Molecular Screening (CSV Upload & Capped Active-Space VQE)")
+    st.caption(
+        f"Screen up to {BATCH_MAX_ROWS} molecules from a CSV (`smiles` required; `name`, `charge`, `spin` optional). "
+        "Eligible molecules (`SIMULATED_QUANTUM` or `HYBRID`) run on seeded RDKit 3D geometries with a capped "
+        "active-space policy (`(4e, 4o)`) and matched-geometry PySCF HF/CASCI references."
+    )
+
+    top_c1, top_c2 = st.columns([2.2, 1.0])
+    with top_c1:
+        csv_mode = st.radio(
+            "Batch Input Source",
+            options=["Upload CSV File", "Use Built-in Sample CSV"],
+            horizontal=True,
+            help="Upload your own CSV file or test immediately using the built-in 10-row sample CSV.",
+        )
+    with top_c2:
+        st.download_button(
+            "Download Sample Batch CSV",
+            data=get_sample_batch_csv(),
+            file_name="qmed_sample_batch.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Download a sample CSV illustrating valid molecules, duplicates, open-shell/charged species, and invalid SMILES.",
+        )
+
+    csv_payload: Optional[Any] = None
+    if csv_mode == "Upload CSV File":
+        uploaded = st.file_uploader(
+            f"Upload CSV (max {BATCH_MAX_ROWS} rows; `smiles` column required)",
+            type=["csv"],
+            help="Upload a comma-separated file with a required 'smiles' column and optional 'name', 'charge', and 'spin' columns.",
+        )
+        if uploaded is not None:
+            csv_payload = uploaded.getvalue()
+    else:
+        csv_payload = get_sample_batch_csv()
+
+    if csv_payload is None:
+        st.info("Upload a CSV file or switch to 'Use Built-in Sample CSV' to preview validation and run batch screening.")
+        return
+
+    val_res = validate_batch_csv(csv_payload, max_rows=BATCH_MAX_ROWS)
+    if not val_res.is_valid:
+        st.error(val_res.error or "CSV validation failed.")
+        return
+
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric(
+        "Total CSV Rows",
+        f"{val_res.total_rows}",
+        help=f"Total rows read from the CSV (maximum allowed: {BATCH_MAX_ROWS}).",
+    )
+    v2.metric(
+        "Valid Unique Rows",
+        f"{len(val_res.valid_rows)}",
+        help="Rows with valid SMILES strings after removing duplicate structures.",
+    )
+    v3.metric(
+        "Duplicate SMILES Removed",
+        f"{val_res.duplicates_removed}",
+        help="Number of duplicate SMILES rows automatically deduplicated before screening.",
+    )
+    v4.metric(
+        "Invalid CSV Rows",
+        f"{len(val_res.invalid_rows)}",
+        help="Rows rejected during CSV parsing due to malformed/empty SMILES or non-integer charge/spin.",
+    )
+
+    if val_res.invalid_rows:
+        with st.expander(f"View {len(val_res.invalid_rows)} Invalid CSV Row(s) & Reasons", expanded=True):
+            df_inv = pd.DataFrame([r.to_dict() for r in val_res.invalid_rows])
+            st.dataframe(df_inv, use_container_width=True, hide_index=True)
+
+    if val_res.duplicate_rows:
+        with st.expander(f"View {val_res.duplicates_removed} Removed Duplicate Row(s)"):
+            st.dataframe(pd.DataFrame(val_res.duplicate_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("**Batch Execution Controls**")
+    bc1, bc2, bc3, bc4, bc5 = st.columns(5)
+    max_sim = bc1.number_input(
+        "Max Molecules to Simulate",
+        min_value=0,
+        max_value=BATCH_MAX_ROWS,
+        value=BATCH_DEFAULT_MAX_SIMULATED,
+        help="Maximum number of eligible molecules (SIMULATED_QUANTUM or HYBRID) to run full PySCF + VQE simulation on.",
+    )
+    mol_timeout = bc2.number_input(
+        "Per-Molecule Timeout (s)",
+        min_value=1.0,
+        max_value=600.0,
+        value=float(BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC),
+        step=5.0,
+        help="Maximum time in seconds allowed for a single molecule's simulation before marking it as TIMEOUT.",
+    )
+    total_budget = bc3.number_input(
+        "Total Time Budget (s)",
+        min_value=5.0,
+        max_value=3600.0,
+        value=float(BATCH_DEFAULT_TOTAL_BUDGET_SEC),
+        step=15.0,
+        help="Total wall-clock time budget in seconds for the entire batch run.",
+    )
+    batch_noisy = bc4.checkbox(
+        "Include Noisy VQE",
+        value=False,
+        help="Run noisy Qiskit Aer simulation in addition to ideal statevector VQE for simulated batch items.",
+    )
+    resume_flag = bc5.checkbox(
+        "Resume from SQLite",
+        value=True,
+        help="Skip re-simulating molecules that are already stored in SQLite batch_items for the same configuration and seed.",
+    )
+
+    btn_col1, btn_col2 = st.columns([1.5, 1.0])
+    start_batch = btn_col1.button(
+        "Start Batch Screening",
+        type="primary",
+        use_container_width=True,
+        help="Validate, screen all rows with QEE, run capped-active-space VQE on eligible rows, and save to SQLite.",
+    )
+    stop_batch = btn_col2.button(
+        "Stop Batch",
+        use_container_width=True,
+        help="Request clean early termination after the current molecule finishes.",
+    )
+
+    if stop_batch:
+        st.session_state["batch_stop_requested"] = True
+        st.warning("Stop requested — batch will halt after the current molecule.")
+
+    if start_batch:
+        st.session_state["batch_stop_requested"] = False
+        progress_bar = st.progress(0.0, text="Initializing batch screening...")
+        status_box = st.empty()
+
+        def _on_progress(curr: int, total: int, mol_name: str, stage: str) -> None:
+            frac = min(1.0, float(curr) / float(max(1, total)))
+            progress_bar.progress(
+                frac,
+                text=f"[{curr}/{total}] Molecule: {mol_name} — {stage}",
+            )
+            status_box.caption(f"Current molecule: **{mol_name}** (`{curr}/{total}`) • Stage: *{stage}*")
+
+        batch_cfg = BatchConfig(
+            seeds=seeds,
+            run_noisy=bool(batch_noisy),
+            noisy_mode=noisy_mode,
+            shots=int(shots),
+            max_simulated_molecules=int(max_sim),
+            per_molecule_timeout_sec=float(mol_timeout),
+            total_time_budget_sec=float(total_budget),
+            resume=bool(resume_flag),
+        )
+
+        batch_res = run_batch_screening(
+            csv_source=csv_payload,
+            config=batch_cfg,
+            max_rows=BATCH_MAX_ROWS,
+            db_path=db_path,
+            progress_callback=_on_progress,
+            stop_requested_fn=lambda: bool(st.session_state.get("batch_stop_requested", False)),
+        )
+        progress_bar.progress(1.0, text=f"Batch #{batch_res.batch_id} finished ({batch_res.status}).")
+        st.session_state["last_batch_result"] = batch_res
+
+    batch_display: Optional[BatchRunResult] = st.session_state.get("last_batch_result")
+    if batch_display is not None:
+        st.divider()
+        st.subheader(f"Batch #{batch_display.batch_id} Results (`{batch_display.status}`)")
+        st.caption(BATCH_CUSTOM_GEOMETRY_CAPTION)
+
+        df_all = batch_display.to_dataframe()
+        decision_counts = df_all["QEE Decision"].value_counts().to_dict() if not df_all.empty else {}
+
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Processed Rows", f"{len(batch_display.items)}", help="Total unique valid CSV rows processed.")
+        s2.metric(
+            "SIMULATED_QUANTUM",
+            f"{decision_counts.get('SIMULATED_QUANTUM', 0)}",
+            help="Molecules fitting within direct full frozen-core quantum simulation limits.",
+        )
+        s3.metric(
+            "HYBRID",
+            f"{decision_counts.get('HYBRID', 0)}",
+            help="Molecules routed to reduced active-space (4e, 4o) hybrid simulation.",
+        )
+        s4.metric(
+            "CLASSICAL_ONLY / DEFERRED",
+            f"{decision_counts.get('CLASSICAL_ONLY', 0) + decision_counts.get('DEFERRED', 0)}",
+            help="Molecules routed to classical-only or deferred due to resource limits.",
+        )
+        s5.metric(
+            "REJECTED",
+            f"{decision_counts.get('REJECTED', 0)}",
+            help="Molecules rejected due to non-zero charge, open-shell spin, or unsupported elements.",
+        )
+        s6.metric(
+            "Simulated / Resumed",
+            f"{batch_display.simulated_count} / {batch_display.resumed_count}",
+            help="Number of molecules simulated live in this run vs. resumed from SQLite cache.",
+        )
+
+        fig_dec = build_batch_decisions_chart(batch_display)
+        st.plotly_chart(fig_dec, use_container_width=True)
+
+        if not df_all.empty:
+            fcol1, fcol2 = st.columns(2)
+            all_decisions = sorted(df_all["QEE Decision"].unique().tolist())
+            all_reliabilities = sorted(df_all["Reliability"].unique().tolist())
+
+            sel_decisions = fcol1.multiselect(
+                "Filter by QEE Decision",
+                options=all_decisions,
+                default=all_decisions,
+                help="Filter the batch results table by QEE routing decision.",
+            )
+            sel_reliabilities = fcol2.multiselect(
+                "Filter by Reliability Label",
+                options=all_reliabilities,
+                default=all_reliabilities,
+                help="Filter the batch results table by VQE reliability rating.",
+            )
+
+            df_filtered = df_all[
+                df_all["QEE Decision"].isin(sel_decisions)
+                & df_all["Reliability"].isin(sel_reliabilities)
+            ]
+            st.dataframe(df_filtered, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "Download Batch Results CSV",
+                data=df_filtered.to_csv(index=False),
+                file_name=f"qmed_batch_{batch_display.batch_id}_results.csv",
+                mime="text/csv",
+                help="Export the filtered batch screening results table as a CSV file.",
+            )
+
+
 def main() -> None:
     """Main Streamlit application entry point for Q-Med."""
     st.set_page_config(
@@ -855,11 +1145,12 @@ def main() -> None:
             help="Run the full Q-Med workflow: QEE eligibility routing, PySCF HF & FCI baselines, multi-seed VQE (if eligible), and SQLite logging.",
         )
 
-    tab_sim, tab_scan, tab_hist = st.tabs(
+    tab_sim, tab_scan, tab_hist, tab_batch = st.tabs(
         [
             "1. 3D Structure, Eligibility & VQE Benchmark",
             "2. H2 Potential Energy Surface & Water Demos",
             "3. SQLite History & Replay",
+            "4. Batch Screening",
         ]
     )
 
@@ -1018,6 +1309,16 @@ def main() -> None:
     with tab_hist:
         render_history_tab(db_path=DEFAULT_DB_PATH)
 
+    with tab_batch:
+        render_batch_screening_tab(
+            seeds=seeds,
+            run_noisy_default=run_noisy,
+            noisy_mode=noisy_mode,
+            shots=int(shots),
+            db_path=DEFAULT_DB_PATH,
+        )
+
 
 if __name__ == "__main__":
     main()
+

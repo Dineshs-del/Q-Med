@@ -54,6 +54,57 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 """
 
+BATCH_SCHEMA_SQL: str = """
+CREATE TABLE IF NOT EXISTS batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    seed INTEGER NOT NULL,
+    total_rows INTEGER NOT NULL,
+    valid_rows INTEGER NOT NULL,
+    duplicates_removed INTEGER NOT NULL,
+    simulated_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    total_runtime_sec REAL
+);
+
+CREATE TABLE IF NOT EXISTS batch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    row_index INTEGER NOT NULL,
+    name TEXT,
+    input_smiles TEXT NOT NULL,
+    canonical_smiles TEXT,
+    charge INTEGER,
+    spin INTEGER,
+    config_json TEXT NOT NULL,
+    seed INTEGER NOT NULL,
+    descriptors_json TEXT,
+    qubits INTEGER,
+    depth INTEGER,
+    gate_count INTEGER,
+    active_space TEXT,
+    qee_decision TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    warnings_json TEXT,
+    outcome TEXT NOT NULL,
+    hf_energy REAL,
+    fci_energy REAL,
+    ideal_vqe_energy REAL,
+    ideal_error_mha REAL,
+    ideal_uncertainty_mha REAL,
+    noisy_vqe_energy REAL,
+    noisy_error_mha REAL,
+    noisy_uncertainty_mha REAL,
+    active_space_error_mha REAL,
+    reliability TEXT,
+    verdict TEXT,
+    geometry_caption TEXT,
+    runtime_sec REAL,
+    FOREIGN KEY (batch_id) REFERENCES batches(id)
+);
+"""
+
 
 @dataclass(frozen=True)
 class PipelineExecutionResult:
@@ -109,13 +160,14 @@ def get_connection(db_path: Union[Path, str] = DEFAULT_DB_PATH) -> sqlite3.Conne
 
 
 def init_db(db_path: Union[Path, str] = DEFAULT_DB_PATH) -> Path:
-    """Create the SQLite database file and `experiments` table if they do not exist."""
+    """Create the SQLite database file and `experiments`, `batches`, and `batch_items` tables."""
     resolved_path = Path(db_path)
     if str(resolved_path) != ":memory:":
         resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
     with get_connection(resolved_path) as conn:
         conn.executescript(EXPERIMENTS_SCHEMA_SQL)
+        conn.executescript(BATCH_SCHEMA_SQL)
         conn.commit()
 
     return resolved_path

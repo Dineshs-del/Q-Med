@@ -133,6 +133,15 @@ q-med/
 
 ---
 
+## Interactive Streamlit UI Features (`app.py`)
+
+- **Instant 3D & 2D Molecular Structure Viewer:** Embedded `py3Dmol` 3D viewer (`_make_html()`) with Plotly 3D ball-and-stick fallback and side-by-side 2D RDKit depiction (`Draw.MolToImage`). Updates immediately upon selecting a benchmark (`data/benchmarks.json` exact coordinates) or typing a custom SMILES (`RDKit` `ETKDGv3` + `MMFF94` approximate force-field coordinates), displaying internal bond lengths ($\text{\AA}$) and bond angles ($^\circ$).
+- **Plain-Language Help & Glossary:** Non-expert `help=` tooltips on every sidebar control and metric, plus an expandable 14-term **"What am I looking at?"** glossary (`SMILES`, `Hartree`, `mHa`, `HF`, `FCI/CASCI`, `VQE`, `UCCSD`, `qubit`, `seed`, `shots`, `noise`, `active space`, `reliability labels`, `quantum advantage`).
+- **Error-vs-Exact (`mHa`) Benchmark Chart:** Plots $|\text{Energy} - E_{\text{FCI/CASCI}}|$ ($\text{mHa}$) across methods with multi-seed $\pm\sigma$ error bars and a horizontal dashed reference line at chemical accuracy ($1.6\text{ mHa}$).
+- **SQLite Experiment Log & Deterministic Replay:** Inspect every stored experiment in `qmed_experiments.db` and replay any row by `ID` to confirm `0.00e+00 Ha` reproducibility.
+
+---
+
 ## Local Quickstart
 
 ```bash

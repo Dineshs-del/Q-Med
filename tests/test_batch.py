@@ -1,0 +1,163 @@
+"""Pytest suite for Q-Med Batch Screening (CSV validation, open-shell/charged rejection, timeout, SQLite, and resume)."""
+
+from pathlib import Path
+import time
+from typing import Any, Dict
+
+from app import build_batch_decisions_chart
+from qmed.batch import (
+    BatchConfig,
+    get_batch_items,
+    get_sample_batch_csv,
+    list_batches,
+    process_batch_row,
+    run_batch_screening,
+    validate_batch_csv,
+)
+from qmed.config import BATCH_CUSTOM_GEOMETRY_CAPTION
+
+
+def test_csv_validation_valid_invalid_duplicates_and_row_limit() -> None:
+    """Verify CSV validation handles valid rows, duplicates removal, invalid SMILES, and row limit."""
+    sample_csv = get_sample_batch_csv()
+    res = validate_batch_csv(sample_csv, max_rows=500)
+
+    assert res.is_valid is True
+    assert res.total_rows == 10
+    # 1 duplicate ('Water_Duplicate,O,0,0') and 1 invalid ('Malformed_Input,not_a_valid_smiles,0,0')
+    assert res.duplicates_removed == 1
+    assert len(res.duplicate_rows) == 1
+    assert res.duplicate_rows[0]["canonical_smiles"] == "O"
+    assert len(res.invalid_rows) == 1
+    assert "not_a_valid_smiles" in res.invalid_rows[0].input_smiles
+    assert "Invalid SMILES" in res.invalid_rows[0].reason
+    assert len(res.valid_rows) == 8
+
+    # Missing 'smiles' column must fail validation cleanly
+    bad_header_res = validate_batch_csv("molecule_name,formula\nWater,H2O\n")
+    assert bad_header_res.is_valid is False
+    assert "smiles" in (bad_header_res.error or "").lower()
+
+    # Exceeding max_rows limit must fail validation cleanly
+    over_limit_res = validate_batch_csv(sample_csv, max_rows=3)
+    assert over_limit_res.is_valid is False
+    assert "exceeds the maximum limit" in (over_limit_res.error or "")
+
+
+def test_process_batch_row_rejections_open_shell_charged_invalid_and_unsupported() -> None:
+    """Verify invalid SMILES, charged, open-shell, and unsupported-element rows are rejected with clear reasons."""
+    # 1. Invalid SMILES
+    inv_item = process_batch_row("not_a_smiles_string", name="BadMol")
+    assert inv_item.qee_decision == "REJECTED"
+    assert inv_item.outcome == "REJECTED_INVALID_SMILES"
+    assert any("Invalid SMILES" in r for r in inv_item.reasons)
+
+    # 2. Charged species ([OH-] or charge != 0)
+    charged_item = process_batch_row("[OH-]", name="Hydroxide", charge=-1, spin=0)
+    assert charged_item.qee_decision == "REJECTED"
+    assert charged_item.outcome == "REJECTED_CHARGED"
+    assert any("Charged molecule" in r for r in charged_item.reasons)
+
+    # 3. Open-shell radical ([CH3] or spin != 0)
+    open_shell_item = process_batch_row("[CH3]", name="MethylRadical", charge=0, spin=1)
+    assert open_shell_item.qee_decision == "REJECTED"
+    assert open_shell_item.outcome == "REJECTED_OPEN_SHELL"
+    assert any("Open-shell" in r for r in open_shell_item.reasons)
+
+    # 4. Unsupported element (Cl in chloroethane)
+    unsup_item = process_batch_row("CCCl", name="Chloroethane", charge=0, spin=0)
+    assert unsup_item.qee_decision == "REJECTED"
+    assert unsup_item.outcome == "REJECTED_UNSUPPORTED_ELEMENT"
+    assert any("Cl" in r for r in unsup_item.reasons)
+
+
+def test_process_batch_row_valid_and_timeout() -> None:
+    """Verify valid row simulation on RDKit geometry and per-molecule timeout handling."""
+    cfg_fast = BatchConfig(
+        seeds=(42, 43, 44),
+        run_noisy=False,
+        ideal_maxiter=15,
+        per_molecule_timeout_sec=30.0,
+    )
+    h2_item = process_batch_row("[H][H]", name="Hydrogen", config=cfg_fast, run_simulation=True)
+    assert h2_item.qee_decision == "SIMULATED_QUANTUM"
+    assert h2_item.outcome == "SIMULATED"
+    assert h2_item.hf_energy is not None
+    assert h2_item.fci_energy is not None
+    assert h2_item.ideal_vqe_energy is not None
+    assert h2_item.ideal_error_mha is not None
+    assert h2_item.ideal_error_mha < 1.6
+    assert h2_item.active_space_error_mha is not None
+    assert h2_item.geometry_caption == BATCH_CUSTOM_GEOMETRY_CAPTION
+
+    # Verify per-molecule timeout triggers TIMEOUT outcome cleanly
+    def _slow_sim(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        time.sleep(0.25)
+        return {}
+
+    cfg_timeout = BatchConfig(
+        seeds=(42, 43, 44),
+        per_molecule_timeout_sec=0.05,
+    )
+    timeout_item = process_batch_row(
+        "[H][H]",
+        name="SlowHydrogen",
+        config=cfg_timeout,
+        run_simulation=True,
+        simulation_fn=_slow_sim,
+    )
+    assert timeout_item.qee_decision == "SIMULATED_QUANTUM"
+    assert timeout_item.outcome == "TIMEOUT"
+    assert any("timeout" in r.lower() for r in timeout_item.reasons)
+
+
+def test_batch_sqlite_storage_and_resume(tmp_path: Path) -> None:
+    """Verify full batch screening saves to batches/batch_items in SQLite and resumes stored rows."""
+    db_file = tmp_path / "test_batch_resume.db"
+    csv_text = "\n".join(
+        [
+            "name,smiles,charge,spin",
+            "Hydrogen,[H][H],0,0",
+            "Helium,[He],0,0",
+            "Aspirin,CC(=O)OC1=CC=CC=C1C(=O)O,0,0",
+            "Hydrogen_Dup,[H][H],0,0",
+            "Methyl_Radical,[CH3],0,1",
+        ]
+    )
+
+    cfg = BatchConfig(
+        seeds=(42, 43, 44),
+        run_noisy=False,
+        ideal_maxiter=15,
+        max_simulated_molecules=5,
+        resume=True,
+    )
+
+    # First batch run: simulates Hydrogen and screens Helium, Aspirin, and rejects Methyl_Radical
+    run1 = run_batch_screening(csv_text, config=cfg, db_path=db_file)
+    assert run1.status == "COMPLETED"
+    assert run1.validation.duplicates_removed == 1
+    assert len(run1.items) == 4
+    assert run1.simulated_count == 1
+    assert run1.resumed_count == 0
+
+    df1 = run1.to_dataframe()
+    assert len(df1) == 4
+    fig = build_batch_decisions_chart(run1)
+    assert len(fig.data) == 1
+
+    # Second batch run with identical config and seed: Hydrogen, Helium, and Aspirin must resume from SQLite
+    run2 = run_batch_screening(csv_text, config=cfg, db_path=db_file)
+    assert run2.status == "COMPLETED"
+    assert run2.resumed_count == 3  # Hydrogen (SIMULATED), Helium (SCREENED_ONLY), Aspirin (SCREENED_ONLY)
+    assert run2.simulated_count == 0
+
+    h2_resumed = [it for it in run2.items if it.name == "Hydrogen"][0]
+    assert h2_resumed.was_resumed is True
+    assert h2_resumed.outcome == "RESUMED"
+    assert h2_resumed.ideal_vqe_energy == run1.items[0].ideal_vqe_energy
+
+    batches = list_batches(db_path=db_file)
+    assert len(batches) == 2
+    items_b1 = get_batch_items(run1.batch_id, db_path=db_file)
+    assert len(items_b1) == 4
