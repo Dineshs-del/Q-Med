@@ -27,6 +27,7 @@ from qmed.config import (
     DEFAULT_DB_PATH,
     HIGH_RELIABILITY_ERROR_HA,
     MAX_CIRCUIT_DEPTH,
+    MAX_HYBRID_FULL_QUBITS,
     MAX_SIMULATED_QUBITS,
     PROJECT_ROOT,
 )
@@ -53,6 +54,7 @@ PRESET_MOLECULES: Dict[str, str] = {
     "H2 — Hydrogen (0.735 Å Benchmark)": "H2",
     "LiH — Lithium Hydride (1.595 Å Benchmark)": "LiH",
     "H2O — Water (Equilibrium Benchmark)": "H2O",
+    "HF — Hydrogen Fluoride (Custom Eligible Demo)": "F",
     "Aspirin — Acetylsalicylic Acid (DEFERRED Demo)": "CC(=O)OC1=CC=CC=C1C(=O)O",
     "Helium — Closed-Shell Atom (CLASSICAL_ONLY Demo)": "[He]",
     "Ammonia — NH3 (HYBRID Active-Space Demo)": "N",
@@ -62,19 +64,25 @@ PRESET_MOLECULES: Dict[str, str] = {
 BENCHMARK_PRESET_IDS = {"H2", "LiH", "H2O"}
 
 DECISION_COLORS: Dict[str, str] = {
-    "SIMULATED_QUANTUM": "#16a34a",
+    "SIMULATED_QUANTUM": "#059669",
     "HYBRID": "#d97706",
-    "CLASSICAL_ONLY": "#2563eb",
-    "DEFERRED": "#dc2626",
-    "REJECTED": "#7f1d1d",
+    "CLASSICAL_ONLY": "#0284c7",
+    "DEFERRED": "#4f46e5",
+    "REJECTED": "#dc2626",
 }
 
 RELIABILITY_COLORS: Dict[str, str] = {
-    "HIGH": "#16a34a",
+    "HIGH": "#059669",
     "MEDIUM": "#ca8a04",
     "LOW": "#ea580c",
     "UNRELIABLE": "#dc2626",
     "INVALID": "#7f1d1d",
+}
+
+CURATED_CSV_PACKS: Dict[str, Path] = {
+    "Built-in Mixed Validation Sample (10 rows)": PROJECT_ROOT / "data" / "sample_batch_10.csv",
+    "Small First/Second-Row Hydrides Set (10 rows)": PROJECT_ROOT / "data" / "quantum_hydrides_set.csv",
+    "FDA Analgesics & Controls Library (20 rows)": PROJECT_ROOT / "data" / "fda_analgesics_library.csv",
 }
 
 PLAIN_LANGUAGE_GLOSSARY: Dict[str, str] = {
@@ -140,13 +148,98 @@ PLAIN_LANGUAGE_GLOSSARY: Dict[str, str] = {
 }
 
 
+def inject_scientific_workbench_css() -> None:
+    """Inject clean laboratory styling, Plus Jakarta Sans + JetBrains Mono typography, and tabular numeral rules."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+
+        html, body, [class*="css"] {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            color: #0f172a;
+        }
+        code, pre, [data-testid="stMetricValue"] {
+            font-family: 'JetBrains Mono', monospace !important;
+            font-variant-numeric: tabular-nums;
+        }
+        .block-container {
+            padding-top: 1.5rem !important;
+            padding-bottom: 2.5rem !important;
+            max-width: 1400px;
+        }
+        div[data-testid="stMetric"] {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 12px 16px;
+        }
+        div[data-testid="stMetricLabel"] p {
+            font-size: 0.76rem !important;
+            font-weight: 600 !important;
+            color: #64748b !important;
+            letter-spacing: 0.01em;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.25rem !important;
+            font-weight: 600 !important;
+            color: #0f172a !important;
+        }
+        .qmed-telemetry-strip {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 14px 20px;
+            margin-bottom: 18px;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        .qmed-telemetry-meta {
+            font-size: 0.82rem;
+            color: #475569;
+            font-family: 'JetBrains Mono', monospace;
+            font-variant-numeric: tabular-nums;
+        }
+        .qmed-panel {
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+        }
+        .qmed-gauge-track {
+            width: 100%;
+            height: 6px;
+            background: #f1f5f9;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 6px;
+        }
+        .qmed-gauge-fill {
+            height: 100%;
+            border-radius: 3px;
+        }
+        button[data-baseweb="tab"] {
+            font-weight: 600 !important;
+            font-size: 0.9rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def format_badge_html(label: str, color_map: Dict[str, str], tooltip: str = "") -> str:
-    """Render an inline HTML badge with an optional hover title attribute."""
+    """Render an inline HTML status indicator with an optional hover title attribute."""
     bg = color_map.get(label, "#475569")
     title_attr = f' title="{tooltip}"' if tooltip else ""
     return (
         f'<span{title_attr} style="background-color:{bg};color:white;padding:3px 10px;'
-        f'border-radius:4px;font-weight:600;font-size:0.85rem;cursor:help;">{label}</span>'
+        f'border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-weight:600;'
+        f'font-size:0.82rem;letter-spacing:0.01em;cursor:help;">{label}</span>'
     )
 
 
@@ -218,7 +311,7 @@ def build_py3dmol_html(
                     "backgroundColor": lbl_bg,
                     "fontColor": lbl_fg,
                     "fontSize": 12,
-                    "backgroundOpacity": 0.75,
+                    "backgroundOpacity": 0.78,
                 },
             )
 
@@ -424,7 +517,7 @@ def build_error_vs_exact_figure(result: PipelineExecutionResult) -> go.Figure:
     ]
     errors_mha = [hf_err_mha, ideal.abs_mean_error_mha]
     spreads_mha = [0.0, ideal.uncertainty_mha]
-    colors = ["#64748b", "#16a34a"]
+    colors = ["#64748b", "#059669"]
 
     if result.noisy_benchmark is not None:
         noisy = result.noisy_benchmark
@@ -437,8 +530,9 @@ def build_error_vs_exact_figure(result: PipelineExecutionResult) -> go.Figure:
         go.Bar(
             x=methods,
             y=errors_mha,
-            error_y={"type": "data", "array": spreads_mha, "visible": True},
+            error_y={"type": "data", "array": spreads_mha, "visible": True, "color": "#0f172a"},
             marker_color=colors,
+            marker_line={"color": "#0f172a", "width": 0.8},
             text=[f"{err:.4f} ± {std:.4f} mHa" for err, std in zip(errors_mha, spreads_mha)],
             textposition="outside",
             name="|Error vs. Exact| (mHa)",
@@ -446,37 +540,52 @@ def build_error_vs_exact_figure(result: PipelineExecutionResult) -> go.Figure:
     )
 
     chem_acc_mha = HIGH_RELIABILITY_ERROR_HA * 1000.0
+    # Shape 0 MUST be the horizontal line at y0 = y1 = 1.6 mHa for test_week6.py compatibility
     fig.add_hline(
         y=chem_acc_mha,
         line_dash="dash",
-        line_color="#16a34a",
+        line_color="#059669",
         line_width=2,
         annotation_text=f"Chemical Accuracy Threshold ({chem_acc_mha:.1f} mHa)",
         annotation_position="top left",
     )
+    fig.add_hrect(
+        y0=0.0,
+        y1=chem_acc_mha,
+        fillcolor="rgba(5, 150, 105, 0.07)",
+        line_width=0,
+    )
 
     fig.update_layout(
-        title=(
-            f"{ideal.molecule_id} ({ideal.active_electrons}e, {ideal.active_orbitals}o) — "
-            "Absolute Error vs. Exact FCI/CASCI (mHa, Lower is Better)"
-        ),
+        title={
+            "text": (
+                f"{ideal.molecule_id} ({ideal.active_electrons}e, {ideal.active_orbitals}o) — "
+                "Absolute Error vs. Exact FCI/CASCI (mHa, Lower is Better)"
+            ),
+            "font": {"family": "Plus Jakarta Sans, sans-serif", "size": 15, "color": "#0f172a"},
+        },
         yaxis_title="|Energy − Matched FCI/CASCI| (mHa)",
         xaxis_title="Method",
         template="plotly_white",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font={"family": "Plus Jakarta Sans, sans-serif", "color": "#0f172a"},
+        yaxis={"gridcolor": "#e2e8f0", "zerolinecolor": "#cbd5e1"},
         height=440,
+        margin={"l": 50, "r": 30, "t": 60, "b": 45},
     )
     return fig
 
 
 # Keep backward-compatible alias for existing tests
-build_ideal_vs_noisy_figure = build_error_vs_exact_figure
+build_ideal_vs_noisy_figure = build_error_vs_noisy_figure = build_error_vs_exact_figure
 
 
 def render_glossary_expander() -> None:
     """Render the plain-language 'What am I looking at?' glossary expander."""
-    with st.expander("What am I looking at? (Plain-Language Glossary)"):
+    with st.expander("What am I looking at? (Plain-Language Quantum Chemistry Glossary)"):
         st.markdown(
-            "New to quantum chemistry? Here is a quick guide to every term displayed on this page:"
+            "New to quantum chemistry? Here is a concise reference for every technical term and unit on this workbench:"
         )
         g_cols = st.columns(2)
         items = list(PLAIN_LANGUAGE_GLOSSARY.items())
@@ -490,8 +599,9 @@ def render_glossary_expander() -> None:
 def render_molecule_viewer_and_descriptors(
     target_input: str,
     is_preset_mode: bool,
+    preview_qee: Optional[QEEResult] = None,
 ) -> bool:
-    """Render the interactive 3D/2D viewer beside RDKit descriptors at the top of Tab 1."""
+    """Render the top molecular telemetry ribbon, interactive 3D/2D viewer, and RDKit descriptors."""
     resolved_smiles, bm_id = resolve_input_smiles(target_input)
     val_res = validate_and_describe(resolved_smiles)
 
@@ -514,6 +624,40 @@ def render_molecule_viewer_and_descriptors(
     except MoleculeValidationError as exc:
         st.warning(f"Could not build 3D structure: {exc}")
         return False
+
+    # Top Molecular Telemetry Ribbon
+    if preview_qee is not None:
+        dec_label = preview_qee.decision or "UNKNOWN"
+        badge_html = format_badge_html(dec_label, DECISION_COLORS)
+        est_q = preview_qee.features.get("estimated_qubits", "—")
+        est_d = preview_qee.features.get("estimated_circuit_depth", 0)
+        act_e = preview_qee.features.get("active_electrons", "—")
+        act_o = preview_qee.features.get("active_spatial_orbitals", "—")
+        geom_tag = "Exact Benchmark Coordinates" if use_bm_coords else "Seeded RDKit MMFF94 Coordinates"
+        st.markdown(
+            f"""
+            <div class="qmed-telemetry-strip">
+                <div>
+                    <span style="font-weight:700;font-size:1.05rem;color:#0f172a;">{struct_3d.title}</span>
+                    <span style="margin:0 10px;color:#cbd5e1;">·</span>
+                    <span class="qmed-telemetry-meta">Formula: <strong>{desc.formula}</strong></span>
+                    <span style="margin:0 10px;color:#cbd5e1;">·</span>
+                    <span class="qmed-telemetry-meta">Canonical SMILES: <strong>{desc.canonical_smiles}</strong></span>
+                    <span style="margin:0 10px;color:#cbd5e1;">·</span>
+                    <span style="font-size:0.8rem;color:#64748b;">{geom_tag}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:14px;">
+                    <span class="qmed-telemetry-meta">Active: ({act_e}e, {act_o}o)</span>
+                    <span style="color:#cbd5e1;">·</span>
+                    <span class="qmed-telemetry-meta">Qubits: {est_q}/{MAX_SIMULATED_QUBITS}</span>
+                    <span style="color:#cbd5e1;">·</span>
+                    <span class="qmed-telemetry-meta">Depth: {est_d:,}/{MAX_CIRCUIT_DEPTH:,}</span>
+                    {badge_html}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     left_col, right_col = st.columns([1.45, 1.0], gap="large")
 
@@ -570,12 +714,12 @@ def render_molecule_viewer_and_descriptors(
                 st.plotly_chart(fallback_fig, use_container_width=True)
 
             st.caption(
-                "Mouse: **Drag** to rotate • **Scroll** to zoom • **Right-drag** or **Shift+drag** to move."
+                "Mouse: **Drag** to rotate · **Scroll** to zoom · **Right-drag** or **Shift+drag** to pan."
             )
             st.caption(struct_3d.caption)
 
         with v2d_col:
-            st.markdown("**2D Structure (RDKit)**")
+            st.markdown("**2D Topological Structure (RDKit)**")
             img_2d = render_rdkit_2d_image(desc.canonical_smiles, size=(240, 220))
             if img_2d is not None:
                 st.image(img_2d, caption=f"SMILES: {desc.canonical_smiles}", use_container_width=True)
@@ -624,7 +768,7 @@ def render_molecule_viewer_and_descriptors(
         )
 
         df_bonds, df_angles = build_geometry_tables(struct_3d)
-        st.markdown("**Internal Geometry (from Displayed 3D Coordinates)**")
+        st.markdown("**Internal Coordinates (from Displayed 3D Geometry)**")
         if not df_bonds.empty:
             g1, g2 = st.columns([1.1, 1.0])
             with g1:
@@ -643,7 +787,7 @@ def render_molecule_viewer_and_descriptors(
 
 
 def render_qee_card(qee: QEEResult) -> None:
-    """Render the Quantum Eligibility Engine (QEE v1) decision card with plain-language tooltips."""
+    """Render the Quantum Eligibility Engine (QEE v1) decision card with capacity bars and tooltips."""
     st.subheader("Quantum Eligibility Engine (QEE v1) Decision")
     decision_label = qee.decision or "INVALID_INPUT"
     decision_tooltip = (
@@ -653,6 +797,9 @@ def render_qee_card(qee: QEEResult) -> None:
     )
     badge_html = format_badge_html(decision_label, DECISION_COLORS, tooltip=decision_tooltip)
 
+    est_q = int(qee.features.get("estimated_qubits", 0) or 0)
+    est_d = int(qee.features.get("estimated_circuit_depth", 0) or 0)
+
     col1, col2, col3, col4 = st.columns(4)
     col1.markdown(
         f"**Routing Decision** ℹ️<br>{badge_html}",
@@ -661,12 +808,12 @@ def render_qee_card(qee: QEEResult) -> None:
     )
     col2.metric(
         "Estimated Qubits (Frozen-Core)",
-        f"{qee.features.get('estimated_qubits', '—')} / {MAX_SIMULATED_QUBITS}",
-        help="Number of quantum bits required to represent the active valence orbitals after freezing inner-shell core electrons (direct limit: 12 qubits).",
+        f"{est_q} / {MAX_SIMULATED_QUBITS}",
+        help="Number of quantum bits required to represent the active valence orbitals after freezing inner-shell core electrons (direct limit: 12 qubits; hybrid limit: 24 qubits).",
     )
     col3.metric(
         "Estimated UCCSD Depth",
-        f"{qee.features.get('estimated_circuit_depth', 0):,} / {MAX_CIRCUIT_DEPTH:,}",
+        f"{est_d:,} / {MAX_CIRCUIT_DEPTH:,}",
         help="Estimated number of sequential quantum gate layers in the decomposed UCCSD circuit (direct limit: 5,000 layers).",
     )
     col4.metric(
@@ -674,6 +821,36 @@ def render_qee_card(qee: QEEResult) -> None:
         f"{int(round(qee.confidence * 100))}%",
         help="Rule-based score indicating how clearly the molecule falls inside or outside the qubit and circuit-depth thresholds.",
     )
+
+    # Capacity gauges for Qubits and Gate Depth
+    q_pct = min(100.0, (float(est_q) / float(MAX_HYBRID_FULL_QUBITS)) * 100.0)
+    q_color = "#059669" if est_q <= MAX_SIMULATED_QUBITS else ("#d97706" if est_q <= MAX_HYBRID_FULL_QUBITS else "#dc2626")
+    d_pct = min(100.0, (float(est_d) / float(MAX_CIRCUIT_DEPTH)) * 100.0)
+    d_color = "#059669" if est_d <= MAX_CIRCUIT_DEPTH else "#d97706"
+
+    gcol1, gcol2 = st.columns(2)
+    with gcol1:
+        st.markdown(
+            f"""
+            <div style="font-size:0.78rem;color:#475569;display:flex;justify-content:space-between;">
+                <span>Full Frozen-Core Qubit Load</span>
+                <span style="font-family:'JetBrains Mono',monospace;">{est_q}q (Direct ≤ {MAX_SIMULATED_QUBITS}q · Hybrid ≤ {MAX_HYBRID_FULL_QUBITS}q)</span>
+            </div>
+            <div class="qmed-gauge-track"><div class="qmed-gauge-fill" style="width:{q_pct:.1f}%;background:{q_color};"></div></div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with gcol2:
+        st.markdown(
+            f"""
+            <div style="font-size:0.78rem;color:#475569;display:flex;justify-content:space-between;">
+                <span>Decomposed UCCSD Circuit Depth Load</span>
+                <span style="font-family:'JetBrains Mono',monospace;">{est_d:,} / {MAX_CIRCUIT_DEPTH:,} gates</span>
+            </div>
+            <div class="qmed-gauge-track"><div class="qmed-gauge-fill" style="width:{d_pct:.1f}%;background:{d_color};"></div></div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     if qee.recommended_active_space is not None:
         st.info(
@@ -723,7 +900,16 @@ def render_history_tab(db_path: Path = DEFAULT_DB_PATH) -> None:
         )
 
     df_hist = pd.DataFrame(summary_rows)
-    st.dataframe(df_hist, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_hist,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "VQE Energy (Ha)": st.column_config.NumberColumn("VQE Energy (Ha)", format="%.6f"),
+            "FCI Energy (Ha)": st.column_config.NumberColumn("FCI Energy (Ha)", format="%.6f"),
+            "|Error| (mHa)": st.column_config.NumberColumn("|Error| (mHa)", format="%.4f"),
+        },
+    )
 
     st.divider()
     st.subheader("Deterministic Experiment Replay by ID")
@@ -796,17 +982,26 @@ def build_batch_decisions_chart(batch_res: BatchRunResult) -> go.Figure:
                 x=decisions,
                 y=values,
                 marker_color=colors,
+                marker_line={"color": "#0f172a", "width": 0.8},
                 text=[str(v) for v in values],
                 textposition="outside",
             )
         ]
     )
     fig.update_layout(
-        title="Batch Screening — Molecule Count by QEE Decision",
+        title={
+            "text": "Batch Screening — Molecule Count by QEE Decision",
+            "font": {"family": "Plus Jakarta Sans, sans-serif", "size": 15, "color": "#0f172a"},
+        },
         xaxis_title="QEE Decision",
         yaxis_title="Number of Molecules",
         template="plotly_white",
+        paper_bgcolor="#ffffff",
+        plot_bgcolor="#ffffff",
+        font={"family": "Plus Jakarta Sans, sans-serif", "color": "#0f172a"},
+        yaxis={"gridcolor": "#e2e8f0"},
         height=360,
+        margin={"l": 50, "r": 30, "t": 55, "b": 45},
     )
     return fig
 
@@ -826,22 +1021,50 @@ def render_batch_screening_tab(
         "active-space policy (`(4e, 4o)`) and matched-geometry PySCF HF/CASCI references."
     )
 
-    top_c1, top_c2 = st.columns([2.2, 1.0])
+    with st.expander("Where can I get CSV files for Batch Screening? (Built-in Packs & Public Databases)"):
+        st.markdown(
+            """
+            You can either select one of the **3 built-in CSV datasets** stored in `data/` right here in Q-Med, or download standard SMILES CSV files from public chemical repositories:
+            - **Built-in `data/` Datasets (Ready to Run or Download Below)**:
+              1. `data/sample_batch_10.csv` — 10-row validation showcase (`H2`, `Water`, `Helium`, `Ammonia`, `Aspirin`, duplicate row, open-shell methyl radical, charged hydroxide ion, chloroethane, and invalid SMILES).
+              2. `data/quantum_hydrides_set.csv` — 10 small first- and second-row hydrides (`[H][H]`, `[LiH]`, `F`, `O`, `N`, `C`, `[He]`, `[Ne]`, `[BeH2]`, `B`) testing `SIMULATED_QUANTUM`, `HYBRID`, and `CLASSICAL_ONLY`.
+              3. `data/fda_analgesics_library.csv` — 20 FDA analgesics & anti-inflammatory compounds (`Aspirin`, `Paracetamol`, `Ibuprofen`, `Naproxen`, `Caffeine`, `Lidocaine`, etc.) demonstrating fast QEE screening at scale.
+            - **External Public Chemical Databases**:
+              - **MoleculeNet (DeepChem)**: Benchmark CSV datasets (`ESOL/Delaney` water solubility, `FreeSolv` hydration free energy, `QM9` small organic molecules, `BBBP`, `ClinTox`) already include a `smiles` column and can be uploaded directly.
+              - **ChEMBL (`ebi.ac.uk/chembl`)**: Search any target or drug class and click *Download CSV*; rename the `Smiles` / `Canonical SMILES` column to `smiles`.
+              - **PubChem (`pubchem.ncbi.nlm.nih.gov`)**: Use *PubChem Compound Search* $\\rightarrow$ *Download* $\\rightarrow$ *CSV* (select `CanonicalSMILES` and rename the header to `smiles`).
+              - **ZINC20 / ZINC15 (`zinc.docking.org`)**: Download fragment or lead-like subsets as `.csv` or `.smi` with `smiles,name` headers.
+            """
+        )
+
+    top_c1, top_c2, top_c3 = st.columns([1.8, 1.4, 1.0])
     with top_c1:
         csv_mode = st.radio(
             "Batch Input Source",
             options=["Upload CSV File", "Use Built-in Sample CSV"],
             horizontal=True,
-            help="Upload your own CSV file or test immediately using the built-in 10-row sample CSV.",
+            help="Upload your own CSV file or test immediately using one of the built-in CSV datasets.",
         )
     with top_c2:
+        selected_pack_label = st.selectbox(
+            "Built-in CSV Dataset (`data/`)",
+            options=list(CURATED_CSV_PACKS.keys()),
+            help="Choose which curated CSV dataset from the project's data/ folder to load or download.",
+        )
+        selected_pack_path = CURATED_CSV_PACKS[selected_pack_label]
+        pack_csv_text = (
+            selected_pack_path.read_text(encoding="utf-8")
+            if selected_pack_path.exists()
+            else get_sample_batch_csv()
+        )
+    with top_c3:
         st.download_button(
             "Download Sample Batch CSV",
-            data=get_sample_batch_csv(),
-            file_name="qmed_sample_batch.csv",
+            data=pack_csv_text,
+            file_name=selected_pack_path.name if selected_pack_path.exists() else "qmed_sample_batch.csv",
             mime="text/csv",
             use_container_width=True,
-            help="Download a sample CSV illustrating valid molecules, duplicates, open-shell/charged species, and invalid SMILES.",
+            help="Download the selected built-in CSV dataset to inspect or edit in Excel / pandas.",
         )
 
     csv_payload: Optional[Any] = None
@@ -854,7 +1077,7 @@ def render_batch_screening_tab(
         if uploaded is not None:
             csv_payload = uploaded.getvalue()
     else:
-        csv_payload = get_sample_batch_csv()
+        csv_payload = pack_csv_text
 
     if csv_payload is None:
         st.info("Upload a CSV file or switch to 'Use Built-in Sample CSV' to preview validation and run batch screening.")
@@ -904,7 +1127,7 @@ def render_batch_screening_tab(
         min_value=0,
         max_value=BATCH_MAX_ROWS,
         value=BATCH_DEFAULT_MAX_SIMULATED,
-        help="Maximum number of eligible molecules (SIMULATED_QUANTUM or HYBRID) to run full PySCF + VQE simulation on.",
+        help="Maximum number of eligible molecules (SIMULATED_QUANTUM or HYBRID) to run full PySCF + VQE simulation on. Set to 0 for instant QEE-only screening.",
     )
     mol_timeout = bc2.number_input(
         "Per-Molecule Timeout (s)",
@@ -961,7 +1184,7 @@ def render_batch_screening_tab(
                 frac,
                 text=f"[{curr}/{total}] Molecule: {mol_name} — {stage}",
             )
-            status_box.caption(f"Current molecule: **{mol_name}** (`{curr}/{total}`) • Stage: *{stage}*")
+            status_box.caption(f"Current molecule: **{mol_name}** (`{curr}/{total}`) · Stage: *{stage}*")
 
         batch_cfg = BatchConfig(
             seeds=seeds,
@@ -1094,18 +1317,19 @@ def main() -> None:
         page_title="Q-Med | Quantum Chemistry Eligibility & VQE Benchmark",
         layout="wide",
     )
+    inject_scientific_workbench_css()
 
-    st.title("Q-Med: Quantum Chemistry Eligibility & VQE Decision-Support Prototype")
+    st.title("Q-Med: Quantum Chemistry Eligibility & VQE Decision-Support Workbench")
     st.caption(
-        "Research & educational prototype evaluating when small-molecule quantum simulation (VQE) "
-        "is worth running against exact PySCF Hartree–Fock and FCI/CASCI baselines. "
-        "Not a clinical or drug-approval tool."
+        "Research & educational workbench evaluating when small-molecule quantum simulation (VQE) "
+        "is worth running against exact PySCF Hartree–Fock and FCI/CASCI baselines · "
+        "STO-3G basis · Qiskit Aer statevector & noise models."
     )
 
     render_glossary_expander()
 
     with st.sidebar:
-        st.header("1. Molecule Input")
+        st.header("01. Molecule Input")
         input_mode = st.radio(
             "Select Input Mode",
             options=["Preset Benchmark / Demo Molecule", "Custom SMILES String"],
@@ -1117,17 +1341,17 @@ def main() -> None:
             preset_label = st.selectbox(
                 "Choose Molecule",
                 options=list(PRESET_MOLECULES.keys()),
-                help="Select a benchmark molecule (H2, LiH, H2O) or a demonstration molecule (Aspirin, Helium, Ammonia, Ethanol).",
+                help="Select a benchmark molecule (H2, LiH, H2O) or a demonstration molecule (HF, Aspirin, Helium, Ammonia, Ethanol).",
             )
             target_input = PRESET_MOLECULES[preset_label]
         else:
             target_input = st.text_input(
                 "Enter SMILES String",
                 value="O",
-                help="Type any valid SMILES text notation — for example: [H][H] (H2), O (water), CCO (ethanol), or CC(=O)OC1=CC=CC=C1C(=O)O (aspirin).",
+                help="Type any valid SMILES text notation — for example: [H][H] (H2), F (HF), O (water), CCO (ethanol), or CC(=O)OC1=CC=CC=C1C(=O)O (aspirin).",
             )
 
-        st.header("2. Simulation Settings")
+        st.header("02. Quantum Solver Settings")
         num_seeds = st.slider(
             "Number of Random Seeds (min 3 for verdict)",
             min_value=3,
@@ -1188,16 +1412,17 @@ def main() -> None:
     )
 
     with tab_sim:
+        preview_res = run_molecule_pipeline(
+            target_input,
+            config=MoleculePipelineConfig(run_simulation=False, persist_to_sqlite=False),
+        )
         valid_molecule = render_molecule_viewer_and_descriptors(
             target_input=target_input,
             is_preset_mode=is_preset_mode,
+            preview_qee=preview_res.qee if preview_res.qee.is_valid else None,
         )
 
         if valid_molecule:
-            preview_res = run_molecule_pipeline(
-                target_input,
-                config=MoleculePipelineConfig(run_simulation=False, persist_to_sqlite=False),
-            )
             st.divider()
             render_qee_card(preview_res.qee)
 
@@ -1297,7 +1522,19 @@ def main() -> None:
                     # 3. Full Total-Energy & Error Comparison Table below the chart
                     st.markdown("**Total Energies & Multi-Seed Benchmark Table**")
                     df_res = build_results_dataframe(pipe_res_display)
-                    st.dataframe(df_res, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        df_res,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Mean Energy (Ha)": st.column_config.NumberColumn("Mean Energy (Ha)", format="%.8f"),
+                            "Matched FCI/CASCI (Ha)": st.column_config.NumberColumn("Matched FCI/CASCI (Ha)", format="%.8f"),
+                            "|Mean Error| (mHa)": st.column_config.NumberColumn("|Mean Error| (mHa)", format="%.4f"),
+                            "Uncertainty ±σ (mHa)": st.column_config.NumberColumn("Uncertainty ±σ (mHa)", format="%.4f"),
+                            "AS Truncation Error (mHa)": st.column_config.NumberColumn("AS Truncation Error (mHa)", format="%.4f"),
+                            "Mean Runtime (s)": st.column_config.NumberColumn("Mean Runtime (s)", format="%.4f"),
+                        },
+                    )
 
                     if pipe_res_display.stored_experiment_ids:
                         st.caption(
@@ -1364,4 +1601,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

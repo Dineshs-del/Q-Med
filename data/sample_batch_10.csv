@@ -1,0 +1,11 @@
+name,smiles,charge,spin
+Hydrogen,[H][H],0,0
+Water,O,0,0
+Helium,[He],0,0
+Ammonia,N,0,0
+Aspirin,CC(=O)OC1=CC=CC=C1C(=O)O,0,0
+Water_Duplicate,O,0,0
+Methyl_Radical,[CH3],0,1
+Hydroxide_Ion,[OH-],-1,0
+Chloroethane,CCCl,0,0
+Malformed_Input,not_a_valid_smiles,0,0

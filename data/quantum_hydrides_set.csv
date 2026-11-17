@@ -1,0 +1,11 @@
+name,smiles,charge,spin
+Hydrogen,[H][H],0,0
+Lithium_Hydride,[LiH],0,0
+Hydrogen_Fluoride,F,0,0
+Water,O,0,0
+Ammonia,N,0,0
+Methane,C,0,0
+Helium,[He],0,0
+Neon,[Ne],0,0
+Beryllium_Hydride,[BeH2],0,0
+Borane,B,0,0

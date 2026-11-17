@@ -6,8 +6,8 @@ py3Dmol==2.5.5
 pyscf==2.15.0
 pytest==9.2.0
 qiskit==1.2.4
-qiskit-aer==0.17.2
-qiskit-algorithms==0.4.0
+qiskit-aer==0.15.1
+qiskit-algorithms==0.3.1
 qiskit-nature==0.7.2
 rdkit==2026.9.1
 scipy==1.15.3
