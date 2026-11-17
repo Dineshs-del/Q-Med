@@ -4,8 +4,14 @@ All numeric thresholds, supported chemical elements, and file paths live here
 to avoid magic numbers inside module logic.
 """
 
+import os
 from pathlib import Path
 from typing import FrozenSet, Tuple
+
+# Prevent OpenMP / BLAS thread contention during multi-seed PySCF and statevector VQE runs
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 # Repository paths
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
@@ -60,8 +66,8 @@ LOW_RELIABILITY_ERROR_HA: float = 0.0500
 BATCH_MAX_ROWS: int = 500
 BATCH_CAPPED_ACTIVE_SPACE: Tuple[int, int] = (4, 4)
 BATCH_DEFAULT_MAX_SIMULATED: int = 10
-BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC: float = 60.0
-BATCH_DEFAULT_TOTAL_BUDGET_SEC: float = 300.0
+BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC: float = 180.0
+BATCH_DEFAULT_TOTAL_BUDGET_SEC: float = 600.0
 BATCH_GEOMETRY_SEED: int = 42
 BATCH_CUSTOM_GEOMETRY_CAPTION: str = (
     "Approximate force-field geometry; reference calculated on the same geometry."

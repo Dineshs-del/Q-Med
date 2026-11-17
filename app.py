@@ -40,9 +40,11 @@ from qmed.molecules import (
 )
 from qmed.qee import QEEResult, evaluate_eligibility, resolve_input_smiles
 from qmed.storage import (
+    MoleculePipelineConfig,
     PipelineExecutionResult,
     list_experiments,
     replay_experiment,
+    run_molecule_pipeline,
     run_qmed_pipeline,
 )
 from qmed.vqe_runner import run_water_option_b_demo
@@ -64,6 +66,7 @@ DECISION_COLORS: Dict[str, str] = {
     "HYBRID": "#d97706",
     "CLASSICAL_ONLY": "#2563eb",
     "DEFERRED": "#dc2626",
+    "REJECTED": "#7f1d1d",
 }
 
 RELIABILITY_COLORS: Dict[str, str] = {
@@ -988,10 +991,35 @@ def render_batch_screening_tab(
         st.subheader(f"Batch #{batch_display.batch_id} Results (`{batch_display.status}`)")
         st.caption(BATCH_CUSTOM_GEOMETRY_CAPTION)
 
+        if batch_display.status == "COMPLETED_WITH_ERRORS" or batch_display.failed_count > 0:
+            st.error(
+                f"Batch status: **{batch_display.status}** — "
+                f"**{batch_display.simulated_count}** simulation(s) succeeded, "
+                f"**{batch_display.failed_count}** simulation(s) failed."
+            )
+            failed_items = [
+                it for it in batch_display.items if it.outcome in {"SIMULATION_ERROR", "TIMEOUT"}
+            ]
+            for fit in failed_items:
+                st.warning(
+                    f"**Row {fit.row_index} ({fit.name} — `{fit.input_smiles}`)** failed with `{fit.outcome}` "
+                    f"at stage **{fit.error_stage or 'unknown'}**: `{fit.error_message or '; '.join(fit.reasons)}`"
+                )
+        elif batch_display.status == "STOPPED":
+            st.warning(
+                f"Batch status: **STOPPED** — **{batch_display.simulated_count}** simulation(s) succeeded, "
+                f"**{batch_display.failed_count}** failed before stop."
+            )
+        else:
+            st.success(
+                f"Batch status: **COMPLETED** — **{batch_display.simulated_count}** simulation(s) succeeded, "
+                f"**0** simulations failed ({batch_display.resumed_count} resumed from SQLite)."
+            )
+
         df_all = batch_display.to_dataframe()
         decision_counts = df_all["QEE Decision"].value_counts().to_dict() if not df_all.empty else {}
 
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1, s2, s3, s4, s5, s6, s7 = st.columns(7)
         s1.metric("Processed Rows", f"{len(batch_display.items)}", help="Total unique valid CSV rows processed.")
         s2.metric(
             "SIMULATED_QUANTUM",
@@ -1014,9 +1042,14 @@ def render_batch_screening_tab(
             help="Molecules rejected due to non-zero charge, open-shell spin, or unsupported elements.",
         )
         s6.metric(
-            "Simulated / Resumed",
+            "Sim. Succeeded / Resumed",
             f"{batch_display.simulated_count} / {batch_display.resumed_count}",
-            help="Number of molecules simulated live in this run vs. resumed from SQLite cache.",
+            help="Number of eligible molecules whose VQE simulation succeeded vs. resumed from SQLite cache.",
+        )
+        s7.metric(
+            "Sim. Failed",
+            f"{batch_display.failed_count}",
+            help="Number of eligible molecules whose VQE simulation failed or timed out.",
         )
 
         fig_dec = build_batch_decisions_chart(batch_display)
@@ -1161,11 +1194,15 @@ def main() -> None:
         )
 
         if valid_molecule:
-            qee_preview = evaluate_eligibility(target_input)
+            preview_res = run_molecule_pipeline(
+                target_input,
+                config=MoleculePipelineConfig(run_simulation=False, persist_to_sqlite=False),
+            )
             st.divider()
-            render_qee_card(qee_preview)
+            render_qee_card(preview_res.qee)
 
             if run_clicked:
+                use_bm_geom = bool(is_preset_mode and target_input in BENCHMARK_PRESET_IDS)
                 with st.spinner(
                     f"Running Q-Med pipeline for '{target_input}' across seeds {list(seeds)}..."
                 ):
@@ -1177,6 +1214,7 @@ def main() -> None:
                         shots=int(shots),
                         ideal_maxiter=int(ideal_maxiter),
                         noisy_maxiter=int(noisy_maxiter),
+                        use_benchmark_geometry=use_bm_geom,
                         db_path=DEFAULT_DB_PATH,
                     )
                 st.session_state["last_pipeline_result"] = pipe_res
@@ -1191,13 +1229,17 @@ def main() -> None:
                 st.divider()
                 st.subheader("Benchmark Results: VQE vs. PySCF Hartree–Fock & Exact FCI/CASCI")
 
-                if pipe_res_display.ideal_benchmark is None:
-                    st.info(
-                        f"Molecule routed to **{pipe_res_display.qee.decision}**. "
-                        f"Quantum circuit execution was skipped per QEE v1 rules, and record "
-                        f"`#{pipe_res_display.primary_experiment_id}` was saved to SQLite."
-                    )
+                if pipe_res_display.status_category == "SIMULATION_FAILED":
+                    st.error(pipe_res_display.status_message)
+                elif pipe_res_display.status_category == "REJECTED":
+                    st.warning(pipe_res_display.status_message)
+                elif pipe_res_display.status_category in {"DEFERRED", "CLASSICAL_ONLY"} or pipe_res_display.ideal_benchmark is None:
+                    st.info(pipe_res_display.status_message)
                 else:
+                    st.success(pipe_res_display.status_message)
+                    if pipe_res_display.geometry_caption:
+                        st.caption(pipe_res_display.geometry_caption)
+
                     ideal_bm = pipe_res_display.ideal_benchmark
                     rel_tooltip = (
                         "Reliability rating: HIGH (error ≤ 1.6 mHa, seed std ≤ 1.6 mHa, AS error ≤ 1.6 mHa), "
@@ -1257,10 +1299,11 @@ def main() -> None:
                     df_res = build_results_dataframe(pipe_res_display)
                     st.dataframe(df_res, use_container_width=True, hide_index=True)
 
-                    st.success(
-                        f"Saved {len(pipe_res_display.stored_experiment_ids)} experiment records "
-                        f"(IDs: `{pipe_res_display.stored_experiment_ids}`) to `{DEFAULT_DB_PATH.name}`."
-                    )
+                    if pipe_res_display.stored_experiment_ids:
+                        st.caption(
+                            f"Saved {len(pipe_res_display.stored_experiment_ids)} experiment records "
+                            f"(IDs: `{pipe_res_display.stored_experiment_ids}`) to `{DEFAULT_DB_PATH.name}`."
+                        )
 
     with tab_scan:
         st.subheader("H2 Bond-Length Dissociation Curve (0.30 Å – 2.50 Å)")

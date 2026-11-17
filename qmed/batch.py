@@ -1,6 +1,5 @@
-"""Batch molecular screening, CSV validation, capped active-space VQE execution, and SQLite batch persistence."""
+"""Batch molecular screening, CSV validation, shared capped active-space VQE execution, and SQLite batch persistence."""
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import csv
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -8,16 +7,11 @@ import io
 import json
 from pathlib import Path
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Descriptors
 
-from qmed.active_space import estimate_qubits_from_smiles, prepare_active_space_problem
-from qmed.benchmark import classify_advantage_verdict, classify_reliability
-from qmed.classical import run_classical_reference
 from qmed.config import (
     BATCH_CAPPED_ACTIVE_SPACE,
     BATCH_CUSTOM_GEOMETRY_CAPTION,
@@ -26,16 +20,17 @@ from qmed.config import (
     BATCH_DEFAULT_TOTAL_BUDGET_SEC,
     BATCH_GEOMETRY_SEED,
     BATCH_MAX_ROWS,
-    DEFAULT_BASIS,
-    DEFAULT_BENCHMARK_SEEDS,
     DEFAULT_DB_PATH,
     DEFAULT_SHOTS,
-    SUPPORTED_ELEMENTS,
 )
-from qmed.molecules import smiles_to_3d_coordinates, validate_and_describe
-from qmed.qee import evaluate_eligibility
-from qmed.storage import get_connection, init_db
-from qmed.vqe_runner import run_vqe_from_prepared
+from qmed.storage import (
+    MoleculePipelineConfig,
+    PipelineExecutionResult,
+    cap_active_space,
+    get_connection,
+    init_db,
+    run_molecule_pipeline,
+)
 
 SAMPLE_BATCH_CSV_CONTENT: str = """name,smiles,charge,spin
 Hydrogen,[H][H],0,0
@@ -108,7 +103,7 @@ class BatchConfig:
     run_noisy: bool = False
     noisy_mode: str = "depolarizing_readout"
     shots: int = DEFAULT_SHOTS
-    ideal_maxiter: int = 25
+    ideal_maxiter: int = 8
     noisy_maxiter: int = 10
     max_simulated_molecules: int = BATCH_DEFAULT_MAX_SIMULATED
     per_molecule_timeout_sec: float = BATCH_DEFAULT_MOLECULE_TIMEOUT_SEC
@@ -150,6 +145,8 @@ class BatchItemResult:
     reasons: List[str]
     warnings: List[str]
     outcome: str
+    error_stage: Optional[str] = None
+    error_message: Optional[str] = None
     hf_energy: Optional[float] = None
     fci_energy: Optional[float] = None
     ideal_vqe_energy: Optional[float] = None
@@ -183,6 +180,7 @@ class BatchRunResult:
     simulated_count: int
     resumed_count: int
     total_runtime_sec: float
+    failed_count: int = 0
 
     def to_dataframe(self) -> pd.DataFrame:
         """Convert processed batch items into a flat pandas DataFrame for UI display and CSV export."""
@@ -214,6 +212,8 @@ class BatchRunResult:
                     "AS Error (mHa)": round(item.active_space_error_mha, 4) if item.active_space_error_mha is not None else None,
                     "Reliability": item.reliability or "—",
                     "Verdict": item.verdict or "—",
+                    "Error Stage": item.error_stage or "—",
+                    "Error Message": item.error_message or "—",
                     "Runtime (s)": round(item.runtime_sec, 3),
                     "Reasons": "; ".join(item.reasons),
                     "Geometry Note": item.geometry_caption or "—",
@@ -316,7 +316,6 @@ def validate_batch_csv(
             )
             continue
 
-        # Parse optional charge and spin
         raw_charge = row.get(charge_col) if charge_col else None
         raw_spin = row.get(spin_col) if spin_col else None
         try:
@@ -400,147 +399,6 @@ def validate_batch_csv(
     )
 
 
-def _simulate_capped_vqe_on_rdkit_geometry(
-    name: str,
-    canonical_smiles: str,
-    act_e: int,
-    act_o: int,
-    config: BatchConfig,
-    stage_cb: Optional[Callable[[str], None]] = None,
-) -> Dict[str, Any]:
-    """Run PySCF HF/CASCI and Ideal (+ optional Noisy) VQE on the same seeded RDKit 3D geometry."""
-    if stage_cb:
-        stage_cb("Generating seeded RDKit 3D geometry")
-    atoms, _, _, _ = smiles_to_3d_coordinates(canonical_smiles, seed=config.geometry_seed)
-
-    if stage_cb:
-        stage_cb(f"Computing PySCF HF & CASCI({act_e}e, {act_o}o) reference")
-    matched_ref = run_classical_reference(
-        atoms=atoms,
-        basis=DEFAULT_BASIS,
-        charge=0,
-        spin=0,
-        frozen_core=True,
-        active_space=(act_e, act_o),
-    )
-    full_fc_ref = run_classical_reference(
-        atoms=atoms,
-        basis=DEFAULT_BASIS,
-        charge=0,
-        spin=0,
-        frozen_core=True,
-        active_space=None,
-    )
-    active_space_error_mha = (matched_ref.fci_energy - full_fc_ref.fci_energy) * 1000.0
-
-    if stage_cb:
-        stage_cb(f"Preparing qubit Hamiltonian for ({act_e}e, {act_o}o)")
-    prepared = prepare_active_space_problem(
-        atoms=atoms,
-        basis=DEFAULT_BASIS,
-        charge=0,
-        spin=0,
-        frozen_core=True,
-        active_space=(act_e, act_o),
-        molecule_id=name,
-    )
-
-    if stage_cb:
-        stage_cb(f"Running Ideal VQE across {len(config.seeds)} seed(s)")
-    ideal_runs = []
-    for s in config.seeds:
-        r_ideal = run_vqe_from_prepared(
-            prepared=prepared,
-            ansatz_type="UCCSD",
-            optimizer_name="SLSQP",
-            seed=int(s),
-            maxiter=int(config.ideal_maxiter),
-            shots=None,
-            noise_model="ideal",
-            noise_model_name="ideal",
-            matched_reference_energy=matched_ref.fci_energy,
-            full_frozen_core_energy=full_fc_ref.fci_energy,
-        )
-        ideal_runs.append(r_ideal)
-
-    ideal_energies = np.array([r.vqe_energy for r in ideal_runs], dtype=float)
-    mean_ideal = float(np.mean(ideal_energies))
-    std_ideal_ha = float(np.std(ideal_energies, ddof=1)) if len(ideal_energies) > 1 else 0.0
-    abs_ideal_err_ha = abs(mean_ideal - matched_ref.fci_energy)
-    ideal_conv = all(r.converged for r in ideal_runs)
-    mean_ideal_time = float(np.mean([r.runtime_sec for r in ideal_runs]))
-
-    _, reliability, rel_warns = classify_reliability(
-        abs_error_ha=abs_ideal_err_ha,
-        uncertainty_ha=std_ideal_ha,
-        converged=ideal_conv,
-        active_space_error_mha=active_space_error_mha,
-        vqe_energy=mean_ideal,
-        matched_fci_energy=matched_ref.fci_energy,
-        is_noisy=False,
-    )
-
-    verdict = classify_advantage_verdict(
-        converged=ideal_conv,
-        num_seeds=len(config.seeds),
-        reliability=reliability,
-        abs_error_ha=abs_ideal_err_ha,
-        vqe_runtime_sec=mean_ideal_time,
-        classical_runtime_sec=matched_ref.total_runtime_sec,
-        classical_exact_available=True,
-        classical_reference_error_ha=0.0,
-    )
-
-    mean_noisy: Optional[float] = None
-    noisy_err_mha: Optional[float] = None
-    noisy_std_mha: Optional[float] = None
-
-    if config.run_noisy:
-        if stage_cb:
-            stage_cb(f"Running Noisy VQE [{config.noisy_mode}] across {len(config.seeds)} seed(s)")
-        noisy_runs = []
-        for s in config.seeds:
-            r_noisy = run_vqe_from_prepared(
-                prepared=prepared,
-                ansatz_type="UCCSD",
-                optimizer_name="COBYLA",
-                seed=int(s),
-                maxiter=int(config.noisy_maxiter),
-                shots=int(config.shots),
-                noise_model=config.noisy_mode,
-                noise_model_name=config.noisy_mode,
-                matched_reference_energy=matched_ref.fci_energy,
-                full_frozen_core_energy=full_fc_ref.fci_energy,
-            )
-            noisy_runs.append(r_noisy)
-
-        noisy_energies = np.array([r.vqe_energy for r in noisy_runs], dtype=float)
-        mean_noisy = float(np.mean(noisy_energies))
-        noisy_std_ha = float(np.std(noisy_energies, ddof=1)) if len(noisy_energies) > 1 else 0.0
-        noisy_err_mha = abs(mean_noisy - matched_ref.fci_energy) * 1000.0
-        noisy_std_mha = noisy_std_ha * 1000.0
-
-    first_run = ideal_runs[0]
-    return {
-        "qubits": first_run.num_qubits,
-        "depth": first_run.circuit_depth,
-        "gate_count": first_run.gate_count,
-        "active_space": f"({act_e}e,{act_o}o)",
-        "hf_energy": matched_ref.hf_energy,
-        "fci_energy": matched_ref.fci_energy,
-        "ideal_vqe_energy": mean_ideal,
-        "ideal_error_mha": abs_ideal_err_ha * 1000.0,
-        "ideal_uncertainty_mha": std_ideal_ha * 1000.0,
-        "noisy_vqe_energy": mean_noisy,
-        "noisy_error_mha": noisy_err_mha,
-        "noisy_uncertainty_mha": noisy_std_mha,
-        "active_space_error_mha": active_space_error_mha,
-        "reliability": reliability,
-        "verdict": verdict,
-        "extra_warnings": rel_warns,
-    }
-
-
 def process_batch_row(
     smiles: str,
     name: Optional[str] = None,
@@ -552,265 +410,104 @@ def process_batch_row(
     stage_callback: Optional[Callable[[str], None]] = None,
     simulation_fn: Optional[Callable[..., Dict[str, Any]]] = None,
 ) -> BatchItemResult:
-    """Pure function to validate, screen with QEE, and (if eligible) simulate a single batch row."""
-    t0 = time.perf_counter()
+    """Validate, screen with QEE, and (if eligible) simulate a single batch row via the shared `run_molecule_pipeline`."""
     cfg = config or BatchConfig()
     primary_seed = int(cfg.seeds[0]) if cfg.seeds else 42
-    display_name = name.strip() if name and name.strip() else smiles.strip()
+    display_name = name.strip() if name and name.strip() else str(smiles).strip()
 
-    if stage_callback:
-        stage_callback("Validating SMILES & computing RDKit descriptors")
+    mol_cfg = MoleculePipelineConfig(
+        seeds=cfg.seeds,
+        geometry_seed=cfg.geometry_seed,
+        capped_active_space=cfg.capped_active_space,
+        use_benchmark_geometry=False,
+        charge=int(charge),
+        spin=int(spin),
+        run_simulation=bool(run_simulation),
+        run_noisy=bool(cfg.run_noisy),
+        noisy_mode=str(cfg.noisy_mode),
+        shots=int(cfg.shots),
+        ideal_maxiter=int(cfg.ideal_maxiter),
+        noisy_maxiter=int(cfg.noisy_maxiter),
+        per_molecule_timeout_sec=float(cfg.per_molecule_timeout_sec),
+        persist_to_sqlite=False,
+        name=display_name,
+    )
 
-    val = validate_and_describe(smiles)
-    if not val.is_valid or val.descriptors is None:
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=None,
-            charge=charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=None,
-            qubits=None,
-            depth=None,
-            gate_count=None,
-            active_space=None,
-            qee_decision="REJECTED",
-            reasons=[val.error or f"Invalid SMILES '{smiles}'."],
-            warnings=[],
-            outcome="REJECTED_INVALID_SMILES",
-            runtime_sec=time.perf_counter() - t0,
-        )
+    pipe_res: PipelineExecutionResult = run_molecule_pipeline(
+        smiles_or_preset=smiles,
+        config=mol_cfg,
+        stage_callback=stage_callback,
+        simulation_fn=simulation_fn,
+    )
 
-    desc = val.descriptors
-    mol = Chem.MolFromSmiles(desc.canonical_smiles, sanitize=True)
-    mol_h = Chem.AddHs(mol)
+    ideal_bm = pipe_res.ideal_benchmark
+    noisy_bm = pipe_res.noisy_benchmark
+    summary = pipe_res.active_space_summary
 
-    formal_charge = int(charge) if int(charge) != 0 else int(Chem.GetFormalCharge(mol))
-    total_electrons = sum(a.GetAtomicNum() for a in mol_h.GetAtoms()) - formal_charge
-    num_radicals = int(Descriptors.NumRadicalElectrons(mol))
-
-    # 1. Reject charged species
-    if formal_charge != 0:
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=None,
-            depth=None,
-            gate_count=None,
-            active_space=None,
-            qee_decision="REJECTED",
-            reasons=[
-                f"Charged molecule (charge={formal_charge}) rejected: batch screening requires neutral (charge=0) species."
-            ],
-            warnings=[],
-            outcome="REJECTED_CHARGED",
-            runtime_sec=time.perf_counter() - t0,
-        )
-
-    # 2. Reject open-shell / radical species
-    if int(spin) != 0 or num_radicals > 0 or (total_electrons % 2 != 0):
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=None,
-            depth=None,
-            gate_count=None,
-            active_space=None,
-            qee_decision="REJECTED",
-            reasons=[
-                f"Open-shell molecule (spin={spin}, radical_electrons={num_radicals}, total_electrons={total_electrons}) "
-                "rejected: batch screening requires closed-shell singlet (spin=0) species."
-            ],
-            warnings=[],
-            outcome="REJECTED_OPEN_SHELL",
-            runtime_sec=time.perf_counter() - t0,
-        )
-
-    # 3. Reject unsupported elements
-    unsupported = [el for el in desc.elements if el not in SUPPORTED_ELEMENTS]
-    if unsupported:
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=None,
-            depth=None,
-            gate_count=None,
-            active_space=None,
-            qee_decision="REJECTED",
-            reasons=[
-                f"Unsupported element(s) for STO-3G workflow: {', '.join(unsupported)}. "
-                f"Supported elements: {', '.join(sorted(SUPPORTED_ELEMENTS))}."
-            ],
-            warnings=[],
-            outcome="REJECTED_UNSUPPORTED_ELEMENT",
-            runtime_sec=time.perf_counter() - t0,
-        )
-
-    # 4. Estimate qubits, depth, and gates & run QEE
-    if stage_callback:
-        stage_callback("Estimating qubits/depth and running QEE v1")
-    est = estimate_qubits_from_smiles(desc.canonical_smiles, frozen_core=True)
-    est_gates = int(round(est.estimated_circuit_depth * 1.75)) if est.estimated_circuit_depth > 0 else 0
-    qee: QEEResult = evaluate_eligibility(desc.canonical_smiles)
-    qee_decision = qee.decision or "DEFERRED"
-    act_str = f"({est.active_electrons}e,{est.active_spatial_orbitals}o)"
-
-    if qee_decision not in {"SIMULATED_QUANTUM", "HYBRID"} or not run_simulation:
-        verdict = (
-            "NO_DEMONSTRATED_ADVANTAGE"
-            if qee_decision == "CLASSICAL_ONLY"
-            else "INSUFFICIENT_EVIDENCE"
-        )
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=est.num_qubits,
-            depth=est.estimated_circuit_depth,
-            gate_count=est_gates,
-            active_space=act_str,
-            qee_decision=qee_decision,
-            reasons=list(qee.reasons),
-            warnings=list(qee.warnings),
-            outcome="SCREENED_ONLY" if qee_decision in {"CLASSICAL_ONLY", "DEFERRED"} else "SKIPPED_SIMULATION_LIMIT",
-            verdict=verdict,
-            runtime_sec=time.perf_counter() - t0,
-        )
-
-    # 5. Eligible for quantum simulation (SIMULATED_QUANTUM or HYBRID): apply capped active-space policy
-    cap_e, cap_o = int(cfg.capped_active_space[0]), int(cfg.capped_active_space[1])
-    eff_e = min(est.active_electrons, cap_e)
-    eff_o = min(est.active_spatial_orbitals, cap_o)
-    # Ensure at least 1 occupied and 1 virtual orbital in the active window
-    if eff_o <= eff_e // 2:
-        eff_o = (eff_e // 2) + 1
-
-    sim_runner = simulation_fn or _simulate_capped_vqe_on_rdkit_geometry
-
-    try:
-        if cfg.per_molecule_timeout_sec and cfg.per_molecule_timeout_sec > 0:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    sim_runner,
-                    display_name,
-                    desc.canonical_smiles,
-                    eff_e,
-                    eff_o,
-                    cfg,
-                    stage_callback,
-                )
-                sim_out = future.result(timeout=float(cfg.per_molecule_timeout_sec))
+    if ideal_bm is not None:
+        qubits = ideal_bm.num_qubits
+        depth = ideal_bm.circuit_depth
+        gates = ideal_bm.gate_count
+        act_str: Optional[str] = f"({ideal_bm.active_electrons}e,{ideal_bm.active_orbitals}o)"
+        combined_warnings = list(dict.fromkeys(list(pipe_res.qee.warnings) + list(ideal_bm.warnings)))
+    elif summary is not None:
+        qubits = summary.num_qubits
+        depth = summary.estimated_circuit_depth
+        gates = int(round(depth * 1.75)) if depth > 0 else 0
+        if pipe_res.effective_active_space is not None:
+            act_str = f"({pipe_res.effective_active_space[0]}e,{pipe_res.effective_active_space[1]}o)"
         else:
-            sim_out = sim_runner(
-                display_name,
-                desc.canonical_smiles,
-                eff_e,
-                eff_o,
-                cfg,
-                stage_callback,
-            )
-    except FuturesTimeoutError:
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=est.num_qubits,
-            depth=est.estimated_circuit_depth,
-            gate_count=est_gates,
-            active_space=f"({eff_e}e,{eff_o}o)",
-            qee_decision=qee_decision,
-            reasons=list(qee.reasons)
-            + [f"Simulation exceeded per-molecule timeout ({cfg.per_molecule_timeout_sec:.2f}s)."],
-            warnings=list(qee.warnings),
-            outcome="TIMEOUT",
-            verdict="INSUFFICIENT_EVIDENCE",
-            geometry_caption=BATCH_CUSTOM_GEOMETRY_CAPTION,
-            runtime_sec=time.perf_counter() - t0,
-        )
-    except Exception as exc:
-        return BatchItemResult(
-            row_index=row_index,
-            name=display_name,
-            input_smiles=smiles,
-            canonical_smiles=desc.canonical_smiles,
-            charge=formal_charge,
-            spin=spin,
-            seed=primary_seed,
-            descriptors=desc.to_dict(),
-            qubits=est.num_qubits,
-            depth=est.estimated_circuit_depth,
-            gate_count=est_gates,
-            active_space=f"({eff_e}e,{eff_o}o)",
-            qee_decision=qee_decision,
-            reasons=list(qee.reasons) + [f"Simulation error: {exc}"],
-            warnings=list(qee.warnings),
-            outcome="SIMULATION_ERROR",
-            verdict="INSUFFICIENT_EVIDENCE",
-            geometry_caption=BATCH_CUSTOM_GEOMETRY_CAPTION,
-            runtime_sec=time.perf_counter() - t0,
-        )
+            act_str = f"({summary.active_electrons}e,{summary.active_spatial_orbitals}o)"
+        combined_warnings = list(pipe_res.qee.warnings)
+    else:
+        qubits = None
+        depth = None
+        gates = None
+        act_str = None
+        combined_warnings = list(pipe_res.qee.warnings)
 
-    combined_warnings = list(dict.fromkeys(list(qee.warnings) + list(sim_out.get("extra_warnings", []))))
+    reasons_list = list(pipe_res.qee.reasons)
+    if pipe_res.outcome in {"SIMULATION_ERROR", "TIMEOUT"} and pipe_res.error_message:
+        err_entry = (
+            f"Stage '{pipe_res.error_stage}': {pipe_res.error_message}"
+            if pipe_res.error_stage
+            else pipe_res.error_message
+        )
+        if err_entry not in reasons_list:
+            reasons_list.append(err_entry)
+
     return BatchItemResult(
         row_index=row_index,
         name=display_name,
         input_smiles=smiles,
-        canonical_smiles=desc.canonical_smiles,
-        charge=formal_charge,
-        spin=spin,
+        canonical_smiles=pipe_res.canonical_smiles,
+        charge=pipe_res.charge,
+        spin=pipe_res.spin,
         seed=primary_seed,
-        descriptors=desc.to_dict(),
-        qubits=sim_out["qubits"],
-        depth=sim_out["depth"],
-        gate_count=sim_out["gate_count"],
-        active_space=sim_out["active_space"],
-        qee_decision=qee_decision,
-        reasons=list(qee.reasons),
+        descriptors=pipe_res.descriptors,
+        qubits=qubits,
+        depth=depth,
+        gate_count=gates,
+        active_space=act_str,
+        qee_decision=pipe_res.qee.decision or "REJECTED",
+        reasons=reasons_list,
         warnings=combined_warnings,
-        outcome="SIMULATED",
-        hf_energy=sim_out["hf_energy"],
-        fci_energy=sim_out["fci_energy"],
-        ideal_vqe_energy=sim_out["ideal_vqe_energy"],
-        ideal_error_mha=sim_out["ideal_error_mha"],
-        ideal_uncertainty_mha=sim_out["ideal_uncertainty_mha"],
-        noisy_vqe_energy=sim_out["noisy_vqe_energy"],
-        noisy_error_mha=sim_out["noisy_error_mha"],
-        noisy_uncertainty_mha=sim_out["noisy_uncertainty_mha"],
-        active_space_error_mha=sim_out["active_space_error_mha"],
-        reliability=sim_out["reliability"],
-        verdict=sim_out["verdict"],
-        geometry_caption=BATCH_CUSTOM_GEOMETRY_CAPTION,
-        runtime_sec=time.perf_counter() - t0,
+        outcome=pipe_res.outcome,
+        error_stage=pipe_res.error_stage,
+        error_message=pipe_res.error_message,
+        hf_energy=ideal_bm.hf_energy if ideal_bm else None,
+        fci_energy=ideal_bm.matched_fci_energy if ideal_bm else None,
+        ideal_vqe_energy=ideal_bm.mean_vqe_energy if ideal_bm else None,
+        ideal_error_mha=ideal_bm.abs_mean_error_mha if ideal_bm else None,
+        ideal_uncertainty_mha=ideal_bm.uncertainty_mha if ideal_bm else None,
+        noisy_vqe_energy=noisy_bm.mean_vqe_energy if noisy_bm else None,
+        noisy_error_mha=noisy_bm.abs_mean_error_mha if noisy_bm else None,
+        noisy_uncertainty_mha=noisy_bm.uncertainty_mha if noisy_bm else None,
+        active_space_error_mha=ideal_bm.active_space_error_mha if ideal_bm else None,
+        reliability=ideal_bm.reliability if ideal_bm else None,
+        verdict=pipe_res.verdict if not pipe_res.outcome.startswith("REJECTED") else None,
+        geometry_caption=pipe_res.geometry_caption,
+        runtime_sec=pipe_res.runtime_sec,
     )
 
 
@@ -846,12 +543,12 @@ def _save_batch_item(
         batch_id, row_index, name, input_smiles, canonical_smiles,
         charge, spin, config_json, seed, descriptors_json,
         qubits, depth, gate_count, active_space, qee_decision,
-        reasons_json, warnings_json, outcome,
+        reasons_json, warnings_json, outcome, error_stage, error_message,
         hf_energy, fci_energy, ideal_vqe_energy, ideal_error_mha, ideal_uncertainty_mha,
         noisy_vqe_energy, noisy_error_mha, noisy_uncertainty_mha,
         active_space_error_mha, reliability, verdict, geometry_caption, runtime_sec
     ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
     );
     """
     params = (
@@ -873,6 +570,8 @@ def _save_batch_item(
         json.dumps(item.reasons),
         json.dumps(item.warnings),
         item.outcome,
+        item.error_stage,
+        item.error_message,
         item.hf_energy,
         item.fci_energy,
         item.ideal_vqe_energy,
@@ -919,8 +618,8 @@ def run_batch_screening(
             """
             INSERT INTO batches (
                 created_at, config_json, seed, total_rows, valid_rows,
-                duplicates_removed, simulated_count, status, total_runtime_sec
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, 'RUNNING', 0.0);
+                duplicates_removed, simulated_count, failed_count, status, total_runtime_sec
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'RUNNING', 0.0);
             """,
             (
                 created_at,
@@ -936,13 +635,14 @@ def run_batch_screening(
 
     items: List[BatchItemResult] = []
     simulated_count = 0
+    failed_count = 0
     resumed_count = 0
-    batch_status = "COMPLETED"
+    was_stopped = False
     total_valid = len(validation.valid_rows)
 
     for idx_zero, vrow in enumerate(validation.valid_rows):
         if stop_requested_fn is not None and stop_requested_fn():
-            batch_status = "STOPPED"
+            was_stopped = True
             break
 
         elapsed = time.perf_counter() - batch_start
@@ -952,7 +652,10 @@ def run_batch_screening(
 
         def _stage_cb(stage_msg: str, _i: int = idx_zero + 1, _name: str = vrow.name) -> None:
             if progress_callback is not None:
-                progress_callback(_i, total_valid, _name, stage_msg)
+                try:
+                    progress_callback(_i, total_valid, _name, stage_msg)
+                except Exception:
+                    pass
 
         # 1. Check Resume Cache if enabled and charge==0, spin==0
         if cfg.resume and vrow.charge == 0 and vrow.spin == 0:
@@ -987,6 +690,8 @@ def run_batch_screening(
                     if cached.get("warnings_json")
                     else [],
                     outcome="RESUMED",
+                    error_stage=cached.get("error_stage"),
+                    error_message=cached.get("error_message"),
                     hf_energy=cached.get("hf_energy"),
                     fci_energy=cached.get("fci_energy"),
                     ideal_vqe_energy=cached.get("ideal_vqe_energy"),
@@ -1028,25 +733,36 @@ def run_batch_screening(
                     **processed.to_dict(),
                     "outcome": "SKIPPED_TIME_BUDGET",
                     "reasons": processed.reasons
-                    + [f"Skipped quantum simulation: total batch time budget ({cfg.total_time_budget_sec:.1f}s) exhausted."],
+                    + [
+                        f"Skipped quantum simulation: total batch time budget ({cfg.total_time_budget_sec:.1f}s) exhausted."
+                    ],
                 }
             )
 
         if processed.outcome == "SIMULATED":
             simulated_count += 1
+        elif processed.outcome in {"SIMULATION_ERROR", "TIMEOUT"}:
+            failed_count += 1
 
         item_id = _save_batch_item(batch_id, config_json, processed, db_path)
         items.append(BatchItemResult(**{**processed.to_dict(), "db_item_id": item_id}))
+
+    if was_stopped:
+        batch_status = "STOPPED"
+    elif failed_count > 0:
+        batch_status = "COMPLETED_WITH_ERRORS"
+    else:
+        batch_status = "COMPLETED"
 
     total_runtime = time.perf_counter() - batch_start
     with get_connection(db_path) as conn:
         conn.execute(
             """
             UPDATE batches
-            SET simulated_count = ?, status = ?, total_runtime_sec = ?
+            SET simulated_count = ?, failed_count = ?, status = ?, total_runtime_sec = ?
             WHERE id = ?;
             """,
-            (simulated_count, batch_status, total_runtime, batch_id),
+            (simulated_count, failed_count, batch_status, total_runtime, batch_id),
         )
         conn.commit()
 
@@ -1059,6 +775,7 @@ def run_batch_screening(
         simulated_count=simulated_count,
         resumed_count=resumed_count,
         total_runtime_sec=total_runtime,
+        failed_count=failed_count,
     )
 
 
