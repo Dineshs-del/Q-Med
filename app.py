@@ -79,10 +79,56 @@ RELIABILITY_COLORS: Dict[str, str] = {
     "INVALID": "#7f1d1d",
 }
 
+CURATED_CSV_DATA: Dict[str, Tuple[str, str]] = {
+    "Built-in Mixed Validation Sample (10 rows)": (
+        "sample_batch_10.csv",
+        get_sample_batch_csv(),
+    ),
+    "Small First/Second-Row Hydrides Set (10 rows)": (
+        "quantum_hydrides_set.csv",
+        """name,smiles,charge,spin
+Hydrogen,[H][H],0,0
+Lithium_Hydride,[LiH],0,0
+Hydrogen_Fluoride,F,0,0
+Water,O,0,0
+Ammonia,N,0,0
+Methane,C,0,0
+Helium,[He],0,0
+Neon,[Ne],0,0
+Beryllium_Hydride,[BeH2],0,0
+Borane,B,0,0
+""",
+    ),
+    "FDA Analgesics & Controls Library (20 rows)": (
+        "fda_analgesics_library.csv",
+        """name,smiles,charge,spin
+Aspirin,CC(=O)OC1=CC=CC=C1C(=O)O,0,0
+Paracetamol,CC(=O)NC1=CC=C(O)C=C1,0,0
+Ibuprofen,CC(C)CC1=CC=C(C=C1)C(C)C(=O)O,0,0
+Naproxen,COC1=CC2=C(C=C1)C=C(C=C2)C(C)C(=O)O,0,0
+Caffeine,CN1C=NC2=C1C(=O)N(C(=O)N2C)C,0,0
+Salicylic_Acid,OC1=CC=CC=C1C(=O)O,0,0
+Benzocaine,CCOC(=O)C1=CC=C(N)C=C1,0,0
+Lidocaine,CCN(CC)CC(=O)NC1=C(C)C=CC=C1C,0,0
+Phenacetin,CCOC1=CC=C(NC(C)=O)C=C1,0,0
+Ketoprofen,CC(C(=O)O)C1=CC(=CC=C1)C(=O)C2=CC=CC=C2,0,0
+Flurbiprofen,CC(C(=O)O)C1=CC=C(C(=C1)F)C2=CC=CC=C2,0,0
+Nabumetone,COC1=CC2=C(C=C1)C=C(CCC(=O)C)C=C2,0,0
+Diflunisal,OC(=O)C1=C(O)C=CC(=C1)C2=C(F)C=C(F)C=C2,0,0
+Etodolac,CCC1=CC=CC2=C1NC3=C2CCOC3(CC)CC(=O)O,0,0
+Tolmetin,CC1=CC=C(C=C1)C(=O)C2=CC=C(C)N2CC(=O)O,0,0
+Diclofenac,OC(=O)CC1=CC=CC=C1NC2=C(Cl)C=CC=C2Cl,0,0
+Indomethacin,COC1=CC2=C(C=C1)N(C(=O)C3=CC=C(Cl)C=C3)C(C)=C2CC(=O)O,0,0
+Water_Control,O,0,0
+Hydrogen_Control,[H][H],0,0
+Helium_Control,[He],0,0
+""",
+    ),
+}
+
 CURATED_CSV_PACKS: Dict[str, Path] = {
-    "Built-in Mixed Validation Sample (10 rows)": PROJECT_ROOT / "data" / "sample_batch_10.csv",
-    "Small First/Second-Row Hydrides Set (10 rows)": PROJECT_ROOT / "data" / "quantum_hydrides_set.csv",
-    "FDA Analgesics & Controls Library (20 rows)": PROJECT_ROOT / "data" / "fda_analgesics_library.csv",
+    label: PROJECT_ROOT / "data" / fname
+    for label, (fname, _) in CURATED_CSV_DATA.items()
 }
 
 PLAIN_LANGUAGE_GLOSSARY: Dict[str, str] = {
@@ -317,7 +363,53 @@ def build_py3dmol_html(
 
     view.zoomTo()
     view.spin(bool(spin))
-    return str(view._make_html())
+    raw_html = str(view._make_html())
+
+    # Replace single-CDN jsdelivr loader (often blocked on campus/ISP networks) with a multi-CDN fallback chain
+    multi_cdn_loader = """var loadScriptWithFallback = function(uris, idx) {
+  idx = idx || 0;
+  return new Promise((resolve, reject) => {
+    if (idx >= uris.length) {
+      reject(new Error("All 3Dmol CDNs unreachable"));
+      return;
+    }
+    var savedexports, savedmodule;
+    if (typeof exports !== 'undefined') savedexports = exports;
+    else exports = {};
+    if (typeof module !== 'undefined') savedmodule = module;
+    else module = {};
+    var tag = document.createElement('script');
+    tag.src = uris[idx];
+    tag.async = true;
+    tag.onload = () => {
+      exports = savedexports;
+      module = savedmodule;
+      resolve();
+    };
+    tag.onerror = () => {
+      exports = savedexports;
+      module = savedmodule;
+      loadScriptWithFallback(uris, idx + 1).then(resolve).catch(reject);
+    };
+    var firstScriptTag = document.getElementsByTagName('script')[0];
+    firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+  });
+};
+if(typeof $3Dmolpromise === 'undefined') {
+  $3Dmolpromise = loadScriptWithFallback([
+    'https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.5.4/3Dmol-min.js',
+    'https://unpkg.com/3dmol@2.5.5/build/3Dmol-min.js',
+    'https://3Dmol.org/build/3Dmol-min.js',
+    'https://cdn.jsdelivr.net/npm/3dmol@2.5.5/build/3Dmol-min.js'
+  ]);
+}"""
+    if "if(typeof $3Dmolpromise === 'undefined')" in raw_html:
+        prefix, suffix = raw_html.split("if(typeof $3Dmolpromise === 'undefined')", 1)
+        if "var viewer_" in suffix:
+            _, viewer_tail = suffix.split("var viewer_", 1)
+            raw_html = prefix + multi_cdn_loader + "\nvar viewer_" + viewer_tail
+
+    return raw_html
 
 
 def build_plotly_3d_molecule_figure(
@@ -663,7 +755,12 @@ def render_molecule_viewer_and_descriptors(
 
     with left_col:
         st.subheader(f"Interactive 3D & 2D Structure — `{desc.formula}`")
-        ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.5, 1.0, 1.0, 1.0, 1.1])
+        ctrl0, ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.35, 1.35, 0.95, 0.95, 0.9, 1.0])
+        renderer_choice = ctrl0.selectbox(
+            "3D Engine",
+            options=["py3Dmol (WebGL)", "Plotly 3D (Offline)"],
+            help="Use py3Dmol WebGL viewer or switch to built-in Plotly 3D (works 100% offline without external JS CDNs).",
+        )
         style_choice = ctrl1.selectbox(
             "3D Style",
             options=["Ball-and-stick", "Stick", "Space-filling", "Wireframe"],
@@ -692,19 +789,7 @@ def render_molecule_viewer_and_descriptors(
 
         v3d_col, v2d_col = st.columns([1.65, 1.0])
         with v3d_col:
-            try:
-                html_str = build_py3dmol_html(
-                    struct_3d,
-                    style=style_choice,
-                    show_labels=show_labels,
-                    show_hydrogens=show_hydrogens,
-                    spin=auto_spin,
-                    background=bg_choice,
-                    width=430,
-                    height=330,
-                )
-                components.html(html_str, height=345, scrolling=False)
-            except Exception:
+            if renderer_choice == "Plotly 3D (Offline)":
                 fallback_fig = build_plotly_3d_molecule_figure(
                     struct_3d,
                     show_labels=show_labels,
@@ -712,9 +797,31 @@ def render_molecule_viewer_and_descriptors(
                     background=bg_choice,
                 )
                 st.plotly_chart(fallback_fig, use_container_width=True)
+            else:
+                try:
+                    html_str = build_py3dmol_html(
+                        struct_3d,
+                        style=style_choice,
+                        show_labels=show_labels,
+                        show_hydrogens=show_hydrogens,
+                        spin=auto_spin,
+                        background=bg_choice,
+                        width=430,
+                        height=330,
+                    )
+                    components.html(html_str, height=345, scrolling=False)
+                except Exception:
+                    fallback_fig = build_plotly_3d_molecule_figure(
+                        struct_3d,
+                        show_labels=show_labels,
+                        show_hydrogens=show_hydrogens,
+                        background=bg_choice,
+                    )
+                    st.plotly_chart(fallback_fig, use_container_width=True)
 
             st.caption(
-                "Mouse: **Drag** to rotate · **Scroll** to zoom · **Right-drag** or **Shift+drag** to pan."
+                "Mouse: **Drag** to rotate · **Scroll** to zoom · **Right-drag** or **Shift+drag** to pan. "
+                "(Tip: If offline or behind a firewall, switch **3D Engine** above to **Plotly 3D (Offline)**.)"
             )
             st.caption(struct_3d.caption)
 
@@ -874,7 +981,23 @@ def render_history_tab(db_path: Path = DEFAULT_DB_PATH) -> None:
     records = list_experiments(limit=200, db_path=db_path)
 
     if not records:
-        st.info("No experiments stored in SQLite yet. Run an analysis in Tab 1 first.")
+        st.info("No experiments stored in SQLite yet. Click below to seed a quick H2 benchmark run or run an analysis in Tab 1.")
+        if st.button(
+            "Seed Quick H2 Benchmark into SQLite History",
+            type="primary",
+            key="seed_hist_btn",
+            help="Run a fast 3-seed H2 benchmark (~1 second) and store it in SQLite so you can inspect and replay it here.",
+        ):
+            with st.spinner("Running 3-seed H2 benchmark and saving to SQLite..."):
+                run_qmed_pipeline(
+                    input_identifier="H2",
+                    seeds=(42, 43, 44),
+                    run_noisy=False,
+                    ideal_maxiter=25,
+                    use_benchmark_geometry=True,
+                    db_path=db_path,
+                )
+            st.rerun()
         return
 
     summary_rows = []
@@ -1048,20 +1171,25 @@ def render_batch_screening_tab(
     with top_c2:
         selected_pack_label = st.selectbox(
             "Built-in CSV Dataset (`data/`)",
-            options=list(CURATED_CSV_PACKS.keys()),
-            help="Choose which curated CSV dataset from the project's data/ folder to load or download.",
+            options=list(CURATED_CSV_DATA.keys()),
+            help="Choose which curated CSV dataset to load or download (embedded in app.py and mirrored in data/).",
         )
+        default_fname, embedded_csv_text = CURATED_CSV_DATA[selected_pack_label]
         selected_pack_path = CURATED_CSV_PACKS[selected_pack_label]
-        pack_csv_text = (
-            selected_pack_path.read_text(encoding="utf-8")
-            if selected_pack_path.exists()
-            else get_sample_batch_csv()
-        )
+        if selected_pack_path.exists():
+            pack_csv_text = selected_pack_path.read_text(encoding="utf-8")
+        else:
+            pack_csv_text = embedded_csv_text
+            try:
+                selected_pack_path.parent.mkdir(parents=True, exist_ok=True)
+                selected_pack_path.write_text(embedded_csv_text, encoding="utf-8")
+            except Exception:
+                pass
     with top_c3:
         st.download_button(
             "Download Sample Batch CSV",
             data=pack_csv_text,
-            file_name=selected_pack_path.name if selected_pack_path.exists() else "qmed_sample_batch.csv",
+            file_name=default_fname,
             mime="text/csv",
             use_container_width=True,
             help="Download the selected built-in CSV dataset to inspect or edit in Excel / pandas.",
