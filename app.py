@@ -638,7 +638,7 @@ def render_molecule_viewer_and_descriptors(
             f"""
             <div class="qmed-telemetry-strip">
                 <div>
-                    <span style="font-weight:700;font-size:1.05rem;color:#0f172a;">{struct_3d.title}</span>
+                    <span style="font-weight:700;font-size:1.05rem;color:#0f172a;">{struct_3d.input_identifier}</span>
                     <span style="margin:0 10px;color:#cbd5e1;">·</span>
                     <span class="qmed-telemetry-meta">Formula: <strong>{desc.formula}</strong></span>
                     <span style="margin:0 10px;color:#cbd5e1;">·</span>

@@ -269,6 +269,11 @@ class Structure3DData:
     bond_lengths: List[BondLengthEntry]
     bond_angles: List[BondAngleEntry]
 
+    @property
+    def title(self) -> str:
+        """Return display identifier for the 3D structure."""
+        return self.input_identifier
+
     def to_xyz(self, include_hydrogens: bool = True) -> str:
         """Format coordinates as an XYZ block, optionally omitting hydrogen atoms."""
         return atoms_to_xyz_block(
